@@ -85,7 +85,9 @@ impl<T: 'static> UniqueStore<T> {
         t: T,
         hash: TypeValueHash,
         eq: UniqueStoreEq<T>,
+        before_insert: impl FnOnce(),
     ) -> usize {
+        let mut before_insert = Some(before_insert);
         match self.unique_stores_map.borrow_mut().entry(hash) {
             Entry::Occupied(mut possible_matches) => {
                 let index_opt = possible_matches.get().iter().find_map(|index| {
@@ -95,12 +97,14 @@ impl<T: 'static> UniqueStore<T> {
                 if let Some(index) = index_opt {
                     index
                 } else {
+                    before_insert.take().unwrap()();
                     let index = self.unique_store.push(t);
                     possible_matches.get_mut().push(index);
                     index
                 }
             }
             Entry::Vacant(slot) => {
+                before_insert.take().unwrap()();
                 let new_index = self.unique_store.push(t);
                 slot.insert(vec![new_index]);
                 new_index
@@ -141,9 +145,12 @@ mod tests {
     #[test]
     fn test_unique_store() {
         let u32_store = UniqueStore::<u32>::default();
-        let u32_0_idx = u32_store.get_or_create_unique(0, TypeValueHash::new(&0u32), &u32::eq);
-        let u32_1_idx = u32_store.get_or_create_unique(1, TypeValueHash::new(&1u32), &u32::eq);
-        let u32_0_1_idx = u32_store.get_or_create_unique(0, TypeValueHash::new(&0u32), &u32::eq);
+        let u32_0_idx =
+            u32_store.get_or_create_unique(0, TypeValueHash::new(&0u32), &u32::eq, || {});
+        let u32_1_idx =
+            u32_store.get_or_create_unique(1, TypeValueHash::new(&1u32), &u32::eq, || {});
+        let u32_0_1_idx =
+            u32_store.get_or_create_unique(0, TypeValueHash::new(&0u32), &u32::eq, || {});
 
         assert!(u32_0_idx == u32_0_1_idx && u32_0_idx != u32_1_idx);
         let u32_0_2_idx = u32_store

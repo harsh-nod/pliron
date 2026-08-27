@@ -611,6 +611,10 @@ mod mutation_epoch_tests {
         let unit = UnitType::get(&ctx);
         assert!(epoch(&ctx) > before_type);
 
+        let after_type_insert = epoch(&ctx);
+        let _same_unit = UnitType::get(&ctx);
+        assert_eq!(epoch(&ctx), after_type_insert);
+
         let before_type_mutation = epoch(&ctx);
         let handle: TypeHandle = unit.into();
         drop(handle.deref_mut(&ctx));
@@ -619,6 +623,10 @@ mod mutation_epoch_tests {
         let before_unique = epoch(&ctx);
         let _ = uniqued_any::save(&mut ctx, 7_u32);
         assert!(epoch(&ctx) > before_unique);
+
+        let after_unique_insert = epoch(&ctx);
+        let _ = uniqued_any::save(&mut ctx, 7_u32);
+        assert_eq!(epoch(&ctx), after_unique_insert);
     }
 
     #[test]

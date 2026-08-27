@@ -123,12 +123,12 @@ pub trait Type: Printable + Verify + Downcast + Sync + Send + Debug {
     where
         Self: Sized,
     {
-        ctx.note_ir_mutation_attempt();
         let hash = t.hash_type();
         let idx = ctx.type_store.get_or_create_unique(
             TypeObj(RefCell::new(Box::new(t))),
             hash,
             &TypeObj::eq,
+            || ctx.note_ir_mutation_attempt(),
         );
         TypedHandle(TypeHandle(idx), PhantomData::<Self>)
     }
