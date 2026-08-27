@@ -123,6 +123,7 @@ pub trait Type: Printable + Verify + Downcast + Sync + Send + Debug {
     where
         Self: Sized,
     {
+        ctx.note_ir_mutation_attempt();
         let hash = t.hash_type();
         let idx = ctx.type_store.get_or_create_unique(
             TypeObj(RefCell::new(Box::new(t))),
@@ -348,6 +349,7 @@ impl TypeHandle {
     /// This is useful when building recursive types, and the caller must ensure
     /// that the mutation does not change the hash-relevant contents of the type.
     pub fn deref_mut<'a>(&self, ctx: &'a Context) -> RefMut<'a, dyn Type> {
+        ctx.note_ir_mutation_attempt();
         RefMut::map(
             ctx.type_store
                 .unique_store

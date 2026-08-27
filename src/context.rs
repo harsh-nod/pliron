@@ -47,11 +47,35 @@ impl Display for ArenaIndex {
     }
 }
 
+/// Opaque observation of one [Context]'s monotonic IR mutation-attempt
+/// counter. Callers can compare observations but cannot manufacture them.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IrMutationAttemptEpoch(u64);
+
+impl IrMutationAttemptEpoch {
+    /// Numeric value for diagnostics and monotonicity checks.
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// The mutation-attempt counter exhausted its bounded u64 representation.
+/// Once exhausted, the context can no longer certify a mutation-free interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("IR mutation-attempt epoch exhausted")]
+pub struct IrMutationAttemptEpochExhausted;
+
 /// An arena allocation pool for IR objects.
 pub type Arena<T> = SlotMap<ArenaIndex, RefCell<T>>;
 
 /// A context stores all IR data of this compilation session.
 pub struct Context {
+    /// Monotonic counter incremented before every mutation route that can be
+    /// reached through a shared [Context] reference, and before arena
+    /// allocation/deallocation through an exclusive reference.
+    ir_mutation_attempt_epoch: Cell<u64>,
+    /// Once the counter is exhausted, observations fail closed permanently.
+    ir_mutation_attempt_epoch_exhausted: Cell<bool>,
     /// A unique number for each `Value` in the context.
     /// Serves as a generation counter against accessing invalid `Value`s.
     pub(crate) value_counter: Cell<u64>,
@@ -81,6 +105,33 @@ impl Context {
         Self::default()
     }
 
+    /// Observe the current IR mutation-attempt epoch.
+    ///
+    /// The epoch advances *before* PLIRON returns mutable access or mutates a
+    /// context-owned IR store. It therefore records failed mutable borrows and
+    /// mutate-then-restore sequences as well as retained mutations. Equality
+    /// only has meaning for two observations of the same [Context].
+    pub fn ir_mutation_attempt_epoch(
+        &self,
+    ) -> core::result::Result<IrMutationAttemptEpoch, IrMutationAttemptEpochExhausted> {
+        if self.ir_mutation_attempt_epoch_exhausted.get() {
+            Err(IrMutationAttemptEpochExhausted)
+        } else {
+            Ok(IrMutationAttemptEpoch(self.ir_mutation_attempt_epoch.get()))
+        }
+    }
+
+    /// Records an attempted mutation before any mutable access is granted.
+    pub(crate) fn note_ir_mutation_attempt(&self) {
+        if self.ir_mutation_attempt_epoch_exhausted.get() {
+            return;
+        }
+        match self.ir_mutation_attempt_epoch.get().checked_add(1) {
+            Some(next) => self.ir_mutation_attempt_epoch.set(next),
+            None => self.ir_mutation_attempt_epoch_exhausted.set(true),
+        }
+    }
+
     /// Is the IR in this context empty?
     /// An IR is considered empty if it has no operations, basic blocks, or regions.
     /// This does not check for types, dialects, ops, or aux_data stored in the context.
@@ -90,6 +141,7 @@ impl Context {
 
     /// Get a unique number for a new value.
     pub(crate) fn get_new_value_uid(&self) -> u64 {
+        self.note_ir_mutation_attempt();
         let uid = self.value_counter.get();
         self.value_counter.set(uid + 1);
         uid
@@ -97,6 +149,7 @@ impl Context {
 
     /// Get a unique number for a new use.
     pub(crate) fn get_new_use_uid(&self) -> u64 {
+        self.note_ir_mutation_attempt();
         let uid = self.use_counter.get();
         self.use_counter.set(uid + 1);
         uid
@@ -106,6 +159,8 @@ impl Context {
 impl Default for Context {
     fn default() -> Self {
         let mut ctx = Context {
+            ir_mutation_attempt_epoch: Cell::new(0),
+            ir_mutation_attempt_epoch_exhausted: Cell::new(false),
             value_counter: Cell::new(0),
             use_counter: Cell::new(0),
             operations: Arena::default(),
@@ -152,6 +207,7 @@ pub(crate) mod private {
 
         /// Allocates object on the arena, given a creator function.
         fn alloc<T: FnOnce(Ptr<Self>) -> Self>(ctx: &mut Context, f: T) -> Ptr<Self> {
+            ctx.note_ir_mutation_attempt();
             let creator = |idx: ArenaIndex| {
                 let t = f(Ptr::<Self> {
                     idx,
@@ -167,6 +223,7 @@ pub(crate) mod private {
 
         /// Deallocates this object from the arena.
         fn dealloc(ptr: Ptr<Self>, ctx: &mut Context) {
+            ctx.note_ir_mutation_attempt();
             Self::dealloc_sub_objects(ptr, ctx);
             Self::get_arena_mut(ctx).remove(ptr.idx);
         }
@@ -212,6 +269,7 @@ impl<'a, T: ArenaObj> Ptr<T> {
     /// to enable printing the interior mutability violation locations.
     #[track_caller]
     pub fn deref_mut(&self, ctx: &'a Context) -> RefMut<'a, T> {
+        ctx.note_ir_mutation_attempt();
         T::get_arena(ctx)
             .get(self.idx)
             .expect("Dangling Ptr deref_mut")
@@ -235,6 +293,7 @@ impl<'a, T: ArenaObj> Ptr<T> {
     /// If [Ptr] is dangling or already borrowed, an [Error](crate::result::Error)
     /// with [DanglingPtrDerefError] or [BorrowMutError](core::cell::BorrowMutError) is returned.
     pub fn try_deref_mut(&self, ctx: &'a Context) -> Result<RefMut<'a, T>> {
+        ctx.note_ir_mutation_attempt();
         T::get_arena(ctx)
             .get(self.idx)
             .ok_or_else(|| arg_error_noloc!(DanglingPtrDerefError))?
@@ -501,4 +560,76 @@ macro_rules! context_registration {
             }
         };
     };
+}
+
+#[cfg(test)]
+mod mutation_epoch_tests {
+    use super::{Context, private::ArenaObj};
+    use crate::{
+        basic_block::BasicBlock, builtin::types::UnitType, r#type::TypeHandle, uniqued_any,
+    };
+    use alloc::vec;
+
+    fn epoch(ctx: &Context) -> u64 {
+        ctx.ir_mutation_attempt_epoch().unwrap().value()
+    }
+
+    #[test]
+    fn read_only_access_preserves_epoch() {
+        let mut ctx = Context::new();
+        let block = BasicBlock::new(&mut ctx, None, vec![]);
+        let before = epoch(&ctx);
+        assert!(block.deref(&ctx).attributes.0.is_empty());
+        assert_eq!(epoch(&ctx), before);
+    }
+
+    #[test]
+    fn arena_mutation_and_failed_mutable_borrow_advance_epoch() {
+        let mut ctx = Context::new();
+        let block = BasicBlock::new(&mut ctx, None, vec![]);
+
+        let before_mutation = epoch(&ctx);
+        block.deref_mut(&ctx).attributes.0.clear();
+        assert!(epoch(&ctx) > before_mutation);
+
+        let read_guard = block.deref(&ctx);
+        let before_failed_attempt = epoch(&ctx);
+        assert!(block.try_deref_mut(&ctx).is_err());
+        assert!(epoch(&ctx) > before_failed_attempt);
+        drop(read_guard);
+
+        let before_deallocation = epoch(&ctx);
+        ArenaObj::dealloc(block, &mut ctx);
+        assert!(epoch(&ctx) > before_deallocation);
+    }
+
+    #[test]
+    fn type_and_uniqued_store_routes_advance_epoch() {
+        let mut ctx = Context::new();
+
+        let before_type = epoch(&ctx);
+        let unit = UnitType::get(&ctx);
+        assert!(epoch(&ctx) > before_type);
+
+        let before_type_mutation = epoch(&ctx);
+        let handle: TypeHandle = unit.into();
+        drop(handle.deref_mut(&ctx));
+        assert!(epoch(&ctx) > before_type_mutation);
+
+        let before_unique = epoch(&ctx);
+        let _ = uniqued_any::save(&mut ctx, 7_u32);
+        assert!(epoch(&ctx) > before_unique);
+    }
+
+    #[test]
+    fn exhaustion_fails_closed_permanently() {
+        let ctx = Context::new();
+        ctx.ir_mutation_attempt_epoch.set(u64::MAX);
+        assert!(ctx.ir_mutation_attempt_epoch().is_ok());
+
+        ctx.note_ir_mutation_attempt();
+        assert!(ctx.ir_mutation_attempt_epoch().is_err());
+        ctx.note_ir_mutation_attempt();
+        assert!(ctx.ir_mutation_attempt_epoch().is_err());
+    }
 }

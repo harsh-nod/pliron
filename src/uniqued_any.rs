@@ -35,6 +35,7 @@ impl<T: 'static> Hash for UniquedKey<T> {
 
 /// Save a unique copy of an object and get a handle to the saved copy.
 pub fn save<T: Any + Hash + Eq>(ctx: &mut Context, t: T) -> UniquedKey<T> {
+    ctx.note_ir_mutation_attempt();
     let hash = TypeValueHash::new(&t);
     let t = UniquedAny(Box::new(t));
     let eq = |t1: &UniquedAny, t2: &UniquedAny| -> bool {
