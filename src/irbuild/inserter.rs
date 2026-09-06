@@ -108,6 +108,18 @@ impl Printable for BlockInsertionPoint {
 }
 
 impl OpInsertionPoint {
+    pub(crate) fn preflight(&self, ctx: &Context) {
+        match self {
+            OpInsertionPoint::AtBlockStart(block) | OpInsertionPoint::AtBlockEnd(block) => {
+                drop(block.deref(ctx));
+            }
+            OpInsertionPoint::AfterOperation(op) | OpInsertionPoint::BeforeOperation(op) => {
+                drop(op.deref(ctx));
+            }
+            OpInsertionPoint::Unset => panic!("Insertion point is not set"),
+        }
+    }
+
     /// Get the insertion block if set.
     pub fn get_insertion_block(&self, ctx: &Context) -> Option<Ptr<BasicBlock>> {
         match self {
@@ -126,6 +138,19 @@ impl OpInsertionPoint {
 }
 
 impl BlockInsertionPoint {
+    pub(crate) fn preflight(&self, ctx: &Context) {
+        match self {
+            BlockInsertionPoint::AtRegionStart(region)
+            | BlockInsertionPoint::AtRegionEnd(region) => {
+                drop(region.deref(ctx));
+            }
+            BlockInsertionPoint::AfterBlock(block) | BlockInsertionPoint::BeforeBlock(block) => {
+                drop(block.deref(ctx));
+            }
+            BlockInsertionPoint::Unset => panic!("Block insertion point is not set"),
+        }
+    }
+
     /// Get the insertion region if set.
     pub fn get_insertion_region(&self, ctx: &Context) -> Option<Ptr<Region>> {
         match self {
@@ -404,6 +429,7 @@ impl<L: InsertionListener> Inserter for IRInserter<L> {
         label: Option<Identifier>,
         arg_types: Vec<TypeHandle>,
     ) -> Ptr<BasicBlock> {
+        insertion_point.preflight(ctx);
         let block = BasicBlock::new(ctx, label, arg_types);
         self.insert_block(ctx, insertion_point, block);
         self.op_insertion_point = OpInsertionPoint::AtBlockEnd(block);

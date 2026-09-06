@@ -41,6 +41,7 @@ pub struct Region {
 impl Region {
     /// Create a new Region.
     pub(crate) fn new(ctx: &mut Context, parent_op: Ptr<Operation>) -> Ptr<Region> {
+        drop(parent_op.deref(ctx));
         let f = |self_ptr: Ptr<Region>| Region {
             self_ptr,
             blocks: BlocksInRegion::default(),
@@ -54,16 +55,18 @@ impl Region {
     /// Indices of other regions in the current parent will be invalidated.
     pub fn move_to_op(ptr: Ptr<Self>, new_parent_op: Ptr<Operation>, ctx: &Context) {
         let src = ptr.deref(ctx).get_parent_op();
+        drop(src.deref(ctx));
+        drop(new_parent_op.deref(ctx));
         if src == new_parent_op {
             return;
         }
-        let regions = &mut src.deref_mut(ctx).regions;
-        regions.swap_remove(
-            regions
-                .iter()
-                .position(|x| *x == ptr)
-                .expect("Region missing in it's current parent Operation"),
-        );
+        let source_index = src
+            .deref(ctx)
+            .regions
+            .iter()
+            .position(|x| *x == ptr)
+            .expect("Region missing in it's current parent Operation");
+        src.deref_mut(ctx).regions.swap_remove(source_index);
         new_parent_op.deref_mut(ctx).regions.push(ptr);
         ptr.deref_mut(ctx).parent_op = new_parent_op;
     }

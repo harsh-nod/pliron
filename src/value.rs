@@ -94,9 +94,20 @@ impl<T: DefUseParticipant> DefNode<T> {
     where
         T: DefTrait + UseTrait,
     {
+        drop(this.get_defnode_ref(ctx));
+        drop(other.get_defnode_ref(ctx));
+        drop(r#use.user_op.deref(ctx));
+        T::try_find_index(r#use, ctx)
+            .expect("Use is not in its user operation's operands/successors");
+
         if core::ptr::eq(&*this.get_defnode_ref(ctx), &*other.get_defnode_ref(ctx)) {
             return;
         }
+
+        assert!(
+            this.get_defnode_ref(ctx).has_use_of(r#use),
+            "Def: Attempt to replace a use that doesn't exist"
+        );
 
         // Add r#use as a use of `other` and replace the [UseNode].
         let new_use_node = other.get_defnode_mut(ctx).add_use(*other, *r#use);
@@ -237,6 +248,21 @@ impl Value {
         predicate: P,
         other: &Value,
     ) {
+        drop(other.get_defnode_ref(ctx));
+        {
+            let uses = self.get_defnode_ref(ctx);
+            for r#use in uses.uses.iter() {
+                drop(
+                    r#use
+                        .user_op
+                        .try_deref(ctx)
+                        .expect("Use has an invalid user operation"),
+                );
+                <Self as UseTrait>::try_find_index(r#use, ctx)
+                    .expect("Use is not in its user operation's operands/successors");
+            }
+        }
+
         // We collect because we don't want to keep the defnode locked up.
         let touched_uses: Vec<_> = self
             .get_defnode_ref(ctx)
@@ -378,7 +404,7 @@ impl DefTrait for Value {
 
 impl UseTrait for Value {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
-        let op = r#use.user_op.deref(ctx);
+        let op = r#use.user_op.try_deref(ctx)?;
         op.operands
             .iter()
             .position(|operand| operand.use_uid == r#use.use_uid)
@@ -472,6 +498,21 @@ impl Ptr<BasicBlock> {
         predicate: P,
         other: Ptr<BasicBlock>,
     ) {
+        drop(other.get_defnode_ref(ctx));
+        {
+            let uses = self.get_defnode_ref(ctx);
+            for r#use in uses.uses.iter() {
+                drop(
+                    r#use
+                        .user_op
+                        .try_deref(ctx)
+                        .expect("Use has an invalid user operation"),
+                );
+                <Self as UseTrait>::try_find_index(r#use, ctx)
+                    .expect("Use is not in its user operation's operands/successors");
+            }
+        }
+
         let predicate = |ctx: &Context, r#use: &Use<Ptr<BasicBlock>>| {
             let pred_block = r#use
                 .user_op
@@ -534,7 +575,7 @@ impl DefTrait for Ptr<BasicBlock> {
 
 impl UseTrait for Ptr<BasicBlock> {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
-        let op = r#use.user_op.deref(ctx);
+        let op = r#use.user_op.try_deref(ctx)?;
         op.successors
             .iter()
             .position(|succ| succ.use_uid == r#use.use_uid)

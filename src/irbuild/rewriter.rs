@@ -216,6 +216,8 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
     }
 
     fn replace_operation(&mut self, ctx: &mut Context, op: Ptr<Operation>, new_op: Ptr<Operation>) {
+        drop(op.deref(ctx));
+        drop(new_op.deref(ctx));
         if op != new_op
             && self.config.set_loc_on_operation_replacement
             && new_op.deref(ctx).loc().is_unknown()
@@ -232,6 +234,10 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         op: Ptr<Operation>,
         new_values: Vec<Value>,
     ) {
+        drop(op.deref(ctx));
+        for new_value in &new_values {
+            new_value.find_index(ctx);
+        }
         assert!(
             op.deref(ctx).get_num_results() == new_values.len(),
             "Replacement values must match the number of results of the original operation."
@@ -252,6 +258,8 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
     }
 
     fn replace_value_uses_with(&mut self, ctx: &Context, old_value: Value, new_value: Value) {
+        old_value.find_index(ctx);
+        new_value.find_index(ctx);
         if old_value == new_value {
             return;
         }
@@ -323,18 +331,22 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
     }
 
     fn unlink_operation(&mut self, ctx: &Context, op: Ptr<Operation>) {
+        drop(op.deref(ctx));
         self.get_listener_mut().notify_operation_unlinking(ctx, op);
         op.unlink(ctx);
         self.mark_modified();
     }
 
     fn unlink_block(&mut self, ctx: &Context, block: Ptr<BasicBlock>) {
+        drop(block.deref(ctx));
         self.get_listener_mut().notify_block_unlinking(ctx, block);
         block.unlink(ctx);
         self.mark_modified();
     }
 
     fn move_operation(&mut self, ctx: &Context, op: Ptr<Operation>, new_point: OpInsertionPoint) {
+        drop(op.deref(ctx));
+        new_point.preflight(ctx);
         self.unlink_operation(ctx, op);
         ScopedRewriter::new(self, new_point).insert_operation(ctx, op);
     }
@@ -345,6 +357,8 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         block: Ptr<BasicBlock>,
         new_point: BlockInsertionPoint,
     ) {
+        drop(block.deref(ctx));
+        new_point.preflight(ctx);
         self.unlink_block(ctx, block);
         self.insert_block(ctx, new_point, block);
     }
@@ -356,6 +370,8 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         position: OpInsertionPoint,
         new_block_label: Option<Identifier>,
     ) -> Ptr<BasicBlock> {
+        drop(block.deref(ctx));
+        position.preflight(ctx);
         // `create_block` below sets the insert point to the new block, so we save and restore it.
         let mut rewriter = ScopedRewriter::new(self, OpInsertionPoint::Unset);
         let label = new_block_label.or_else(|| {
@@ -391,6 +407,8 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         src_region: Ptr<Region>,
         dest_insertion_point: BlockInsertionPoint,
     ) {
+        drop(src_region.deref(ctx));
+        dest_insertion_point.preflight(ctx);
         assert!(
             src_region
                 != dest_insertion_point

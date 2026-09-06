@@ -171,6 +171,15 @@ impl Operation {
         successors: Vec<Ptr<BasicBlock>>,
         num_regions: usize,
     ) -> Ptr<Operation> {
+        // Authenticate every externally supplied IR object before allocating
+        // the operation or assigning any use IDs.
+        for operand in &operands {
+            drop(operand.get_defnode_ref(ctx));
+        }
+        for successor in &successors {
+            drop(successor.get_defnode_ref(ctx));
+        }
+
         let f = |self_ptr: Ptr<Operation>| Operation {
             self_ptr,
             concrete_op,
@@ -241,6 +250,7 @@ impl Operation {
 
     /// Add a result to the end of the result list, returning its index.
     pub fn push_result(this: Ptr<Self>, ctx: &Context, ty: TypeHandle) -> usize {
+        drop(this.deref(ctx));
         let new_result = OpResult::new(ctx, ty);
         this.deref_mut(ctx).results.push_back(new_result)
     }
@@ -260,6 +270,7 @@ impl Operation {
     /// Insert a new result at `res_idx`, shifting existing results, from `res_idx`, to the right.
     /// Panics on invalid index.
     pub fn insert_result(this: Ptr<Self>, ctx: &Context, res_idx: usize, ty: TypeHandle) {
+        assert!(res_idx <= this.deref(ctx).results.len());
         let new_res = OpResult::new(ctx, ty);
         this.deref_mut(ctx).results.insert(res_idx, new_res);
         debug_info::insert_operation_result_name(ctx, this, res_idx, None);
@@ -364,6 +375,9 @@ impl Operation {
     /// Replace opd_idx'th operand of `this` with `other`. Panics on invalid index.
     /// Any [`Use<Value>`](Use) of the replaced operand will be invalidated.
     pub fn replace_operand(this: Ptr<Operation>, ctx: &Context, opd_idx: usize, other: Value) {
+        let replaced_def = this.deref(ctx).operands[opd_idx].get_def();
+        drop(replaced_def.get_defnode_ref(ctx));
+        drop(other.get_defnode_ref(ctx));
         let new_operand = Operand::new(ctx, other, this);
         core::mem::replace(&mut this.deref_mut(ctx).operands[opd_idx], new_operand)
             .drop_use(ctx, this);
@@ -372,6 +386,8 @@ impl Operation {
     /// Insert a new operand at `opd_idx`, shifting existing operands, from `opd_idx`,
     /// to the right. Panics on invalid index (i.e., `opd_idx` > number of operands).
     pub fn insert_operand(this: Ptr<Operation>, ctx: &Context, opd_idx: usize, new_opd: Value) {
+        assert!(opd_idx <= this.deref(ctx).operands.len());
+        drop(new_opd.get_defnode_ref(ctx));
         let new_opd = Operand::new(ctx, new_opd, this);
         this.deref_mut(ctx).operands.insert(opd_idx, new_opd);
     }
@@ -381,6 +397,8 @@ impl Operation {
     /// Any [`Use<Value>`](Use) of the removed operand is invalidated.
     /// The removed [Value] is returned for convenience.
     pub fn remove_operand(this: Ptr<Operation>, ctx: &Context, opd_idx: usize) -> Value {
+        let removed_def = this.deref(ctx).operands[opd_idx].get_def();
+        drop(removed_def.get_defnode_ref(ctx));
         let removed_opd = this.deref_mut(ctx).operands.remove(opd_idx);
         let removed_value = removed_opd.get_def();
         removed_opd.drop_use(ctx, this);
@@ -410,6 +428,9 @@ impl Operation {
         succ_idx: usize,
         other: Ptr<BasicBlock>,
     ) {
+        let replaced_def = this.deref(ctx).successors[succ_idx].get_def();
+        drop(replaced_def.get_defnode_ref(ctx));
+        drop(other.get_defnode_ref(ctx));
         let new_successor = Operand::new(ctx, other, this);
         core::mem::replace(&mut this.deref_mut(ctx).successors[succ_idx], new_successor)
             .drop_use(ctx, this);
@@ -442,6 +463,8 @@ impl Operation {
         succ_idx: usize,
         new_succ: Ptr<BasicBlock>,
     ) {
+        assert!(succ_idx <= this.deref(ctx).successors.len());
+        drop(new_succ.get_defnode_ref(ctx));
         let new_succ = Operand::new(ctx, new_succ, this);
         this.deref_mut(ctx).successors.insert(succ_idx, new_succ);
     }
@@ -455,6 +478,8 @@ impl Operation {
         ctx: &Context,
         succ_idx: usize,
     ) -> Ptr<BasicBlock> {
+        let removed_def = this.deref(ctx).successors[succ_idx].get_def();
+        drop(removed_def.get_defnode_ref(ctx));
         let removed_succ = this.deref_mut(ctx).successors.remove(succ_idx);
         let removed_block = removed_succ.get_def();
         removed_succ.drop_use(ctx, this);
@@ -506,6 +531,7 @@ impl Operation {
 
     /// Add a new empty region to the operation and return its [Ptr].
     pub fn add_region(ptr: Ptr<Self>, ctx: &mut Context) -> Ptr<Region> {
+        drop(ptr.deref(ctx));
         let region = Region::new(ctx, ptr);
         ptr.deref_mut(ctx).regions.push(region);
         region
@@ -533,6 +559,19 @@ impl Operation {
 
     /// Drop all uses that this operation holds.
     pub fn drop_all_uses(ptr: Ptr<Self>, ctx: &Context) {
+        {
+            let operation = ptr.deref(ctx);
+            for operand in &operation.operands {
+                drop(operand.get_def().get_defnode_ref(ctx));
+            }
+            for successor in &operation.successors {
+                drop(successor.get_def().get_defnode_ref(ctx));
+            }
+            for region in &operation.regions {
+                drop(region.deref(ctx));
+            }
+        }
+
         // The operands cease to be a use of their definitions.
         let operands = core::mem::take(&mut (ptr.deref_mut(ctx).operands));
         for opd in operands.into_iter() {
@@ -624,6 +663,9 @@ impl<T: DefUseParticipant + DefTrait> Operand<T> {
 
     /// Drop this use, removing self from its definition's uses list.
     fn drop_use(&self, ctx: &Context, op: Ptr<Operation>) {
+        // Composite callers preflight both `op` and this definition before
+        // mutating the operand vector. Reborrowing `op` here would overlap the
+        // temporary mutable borrow used by `replace_operand`.
         self.get_def().get_defnode_mut(ctx).remove_use(Use {
             user_op: op,
             use_uid: self.use_uid,
@@ -633,6 +675,8 @@ impl<T: DefUseParticipant + DefTrait> Operand<T> {
 
     /// Create a new Operand in `user_op`.
     fn new(ctx: &Context, def: T, user_op: Ptr<Operation>) -> Operand<T> {
+        drop(user_op.deref(ctx));
+        drop(def.get_defnode_ref(ctx));
         let use_uid = ctx.get_new_use_uid();
         Operand {
             r#use: def.get_defnode_mut(ctx).add_use(
@@ -759,7 +803,7 @@ pub fn verify_value_dominance(ir: Ptr<Operation>, ctx: &Context) -> Result<()> {
 /// Verify an operation and all its nested regions and blocks.
 pub fn verify_operation(opr: Ptr<Operation>, ctx: &Context) -> Result<()> {
     // Verify attributes, operand, successors, region, results, interfaces and the Op's verifier.
-    opr.deref(ctx).verify(ctx)?;
+    opr.try_deref(ctx)?.verify(ctx)?;
     // Verify that every definition in the IR rooted at opr, dominates its uses.
     verify_value_dominance(opr, ctx)
 }

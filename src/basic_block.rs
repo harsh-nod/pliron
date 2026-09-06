@@ -188,6 +188,7 @@ impl BasicBlock {
 
     /// Add an argument to the end of the argument list, returning its index.
     pub fn push_argument(block: Ptr<BasicBlock>, ctx: &Context, ty: TypeHandle) -> usize {
+        drop(block.deref(ctx));
         let new_block_arg = BlockArgument::new(ctx, ty);
         block.deref_mut(ctx).args.push_back(new_block_arg)
     }
@@ -207,6 +208,7 @@ impl BasicBlock {
     /// Insert a new argument at `arg_idx`, shifting existing arguments, from `arg_idx`, to the right.
     /// Panics on invalid index.
     pub fn insert_argument(block: Ptr<BasicBlock>, ctx: &Context, arg_idx: usize, ty: TypeHandle) {
+        assert!(arg_idx <= block.deref(ctx).args.len());
         let new_block_arg = BlockArgument::new(ctx, ty);
         block.deref_mut(ctx).args.insert(arg_idx, new_block_arg);
         debug_info::insert_block_arg_name(ctx, block, arg_idx, None);

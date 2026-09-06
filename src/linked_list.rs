@@ -116,12 +116,58 @@ pub trait LinkedList: private::LinkedList {
     fn get_container(&self) -> Option<Ptr<Self::ContainerType>>;
 }
 
+/// Authenticate and structurally validate a complete list without mutating it.
+fn preflight_linked_list<C: ContainsLinkedList<U> + ArenaObj, U: LinkedList<ContainerType = C>>(
+    container: Ptr<C>,
+    ctx: &Context,
+) {
+    let (head, tail) = {
+        let container = container.deref(ctx);
+        (container.get_head(), container.get_tail())
+    };
+    assert_eq!(head.is_none(), tail.is_none());
+
+    let arena_len = U::get_arena(ctx).len();
+    let mut current = head;
+    let mut previous = None;
+    let mut visited = 0usize;
+    while let Some(node) = current {
+        assert!(visited < arena_len, "LinkedList contains a cycle");
+        visited += 1;
+
+        let (node_previous, next, node_container) = {
+            let node = node.deref(ctx);
+            (node.get_prev(), node.get_next(), node.get_container())
+        };
+        if let Some(node_previous) = node_previous {
+            drop(node_previous.deref(ctx));
+        }
+        if let Some(next) = next {
+            drop(next.deref(ctx));
+        }
+        let node_container = node_container.expect("LinkedList node is missing its container");
+        drop(node_container.deref(ctx));
+        assert!(node_container == container);
+        assert!(node_previous == previous);
+        if next.is_none() {
+            assert!(tail == Some(node));
+        }
+        previous = Some(node);
+        current = next;
+    }
+    assert!(previous == tail);
+}
+
 /// Append all nodes from `donor` to the back of `donee`, leaving `donor` empty.
 pub fn append_linked_list<C: ContainsLinkedList<U> + ArenaObj, U: LinkedList<ContainerType = C>>(
     donee: Ptr<C>,
     donor: Ptr<C>,
     ctx: &Context,
 ) {
+    preflight_linked_list(donee, ctx);
+    preflight_linked_list(donor, ctx);
+    assert!(donee != donor, "Cannot append a linked list to itself");
+
     let mut current = donor.deref(ctx).get_head();
     while let Some(node) = current {
         let next = node.deref(ctx).get_next();
@@ -138,7 +184,7 @@ where
 {
     /// Insert self after mark.
     pub fn insert_after(&self, ctx: &Context, mark: Ptr<T>) {
-        {
+        let (next, container) = {
             let node = self.deref(ctx);
             assert!(
                 node.get_prev().is_none()
@@ -147,33 +193,33 @@ where
                 "LinkedList node must be unlinked before relinking"
             );
             let mark = mark.deref(ctx);
-            assert!(
-                mark.get_container().is_some(),
-                "insert_after: Mark node itself is unlinked"
-            );
-        }
-        let next;
-        let container;
-        // If mark == *self, we don't want two deref_mut() on it.
-        {
-            let mut mark_ref = mark.deref_mut(ctx);
-            container = mark_ref.get_container().unwrap();
-            next = mark_ref.get_next();
-            match next {
-                Some(next) => {
-                    assert!(next.deref(ctx).get_prev().unwrap() == mark);
-                    next.deref_mut(ctx).set_prev(Some(*self));
-                }
-                None => {
-                    assert!(container.deref(ctx).get_tail().unwrap() == mark);
-                    private::ContainsLinkedList::set_tail(
-                        &mut (*container.deref_mut(ctx)),
-                        Some(*self),
-                    );
-                }
+            let container = mark
+                .get_container()
+                .expect("insert_after: Mark node itself is unlinked");
+            (mark.get_next(), container)
+        };
+        drop(container.deref(ctx));
+        match next {
+            Some(next) => {
+                let next_ref = next.deref(ctx);
+                assert!(next_ref.get_prev() == Some(mark));
+                let next_container = next_ref
+                    .get_container()
+                    .expect("LinkedList node is missing its container");
+                drop(next_ref);
+                drop(next_container.deref(ctx));
+                assert!(next_container == container);
             }
-            (*mark_ref).set_next(Some(*self));
+            None => assert!(container.deref(ctx).get_tail() == Some(mark)),
         }
+
+        match next {
+            Some(next) => next.deref_mut(ctx).set_prev(Some(*self)),
+            None => {
+                private::ContainsLinkedList::set_tail(&mut (*container.deref_mut(ctx)), Some(*self))
+            }
+        }
+        mark.deref_mut(ctx).set_next(Some(*self));
 
         let mut node = self.deref_mut(ctx);
         node.set_next(next);
@@ -183,7 +229,7 @@ where
 
     /// Insert self before mark.
     pub fn insert_before(&self, ctx: &Context, mark: Ptr<T>) {
-        {
+        let (prev, container) = {
             let node = self.deref(ctx);
             assert!(
                 node.get_prev().is_none()
@@ -192,34 +238,33 @@ where
                 "LinkedList node must be unlinked before relinking"
             );
             let mark = mark.deref(ctx);
-            assert!(
-                mark.get_container().is_some(),
-                "insert_before: Mark node itself is unlinked"
-            );
+            let container = mark
+                .get_container()
+                .expect("insert_before: Mark node itself is unlinked");
+            (mark.get_prev(), container)
+        };
+        drop(container.deref(ctx));
+        match prev {
+            Some(prev) => {
+                let prev_ref = prev.deref(ctx);
+                assert!(prev_ref.get_next() == Some(mark));
+                let prev_container = prev_ref
+                    .get_container()
+                    .expect("LinkedList node is missing its container");
+                drop(prev_ref);
+                drop(prev_container.deref(ctx));
+                assert!(prev_container == container);
+            }
+            None => assert!(container.deref(ctx).get_head() == Some(mark)),
         }
 
-        let container;
-        let prev;
-        // If mark == *self, we don't want two deref_mut() on it.
-        {
-            let mut mark_ref = mark.deref_mut(ctx);
-            container = mark_ref.get_container().unwrap();
-            prev = mark_ref.get_prev();
-            match prev {
-                Some(prev) => {
-                    assert!(prev.deref(ctx).get_next().unwrap() == mark);
-                    prev.deref_mut(ctx).set_next(Some(*self));
-                }
-                None => {
-                    assert!(container.deref(ctx).get_head().unwrap() == mark);
-                    private::ContainsLinkedList::set_head(
-                        &mut (*container.deref_mut(ctx)),
-                        Some(*self),
-                    );
-                }
+        match prev {
+            Some(prev) => prev.deref_mut(ctx).set_next(Some(*self)),
+            None => {
+                private::ContainsLinkedList::set_head(&mut (*container.deref_mut(ctx)), Some(*self))
             }
-            (*mark_ref).set_prev(Some(*self));
         }
+        mark.deref_mut(ctx).set_prev(Some(*self));
 
         let mut node = self.deref_mut(ctx);
         node.set_prev(prev);
@@ -229,52 +274,86 @@ where
 
     /// Insert self as the head of the list.
     pub fn insert_at_front(&self, container: Ptr<T::ContainerType>, ctx: &Context) {
-        let mut node = self.deref_mut(ctx);
-        assert!(
-            node.get_prev().is_none()
-                && node.get_next().is_none()
-                && node.get_container().is_none(),
-            "LinkedList node must be unlinked before relinking"
-        );
-        let mut container_ref = container.deref_mut(ctx);
-        let head = container_ref.get_head();
+        {
+            let node = self.deref(ctx);
+            assert!(
+                node.get_prev().is_none()
+                    && node.get_next().is_none()
+                    && node.get_container().is_none(),
+                "LinkedList node must be unlinked before relinking"
+            );
+        }
+        let (head, tail) = {
+            let container_ref = container.deref(ctx);
+            (container_ref.get_head(), container_ref.get_tail())
+        };
         match head {
             Some(head) => {
-                assert!(head.deref(ctx).get_prev().is_none());
-                head.deref_mut(ctx).set_prev(Some(*self))
+                let head_ref = head.deref(ctx);
+                assert!(head_ref.get_prev().is_none());
+                let head_container = head_ref
+                    .get_container()
+                    .expect("LinkedList node is missing its container");
+                drop(head_ref);
+                drop(head_container.deref(ctx));
+                assert!(head_container == container);
             }
+            None => assert!(tail.is_none()),
+        }
+
+        match head {
+            Some(head) => head.deref_mut(ctx).set_prev(Some(*self)),
             None => {
-                private::ContainsLinkedList::set_tail(&mut (*container_ref), Some(*self));
+                private::ContainsLinkedList::set_tail(&mut (*container.deref_mut(ctx)), Some(*self))
             }
         }
+        let mut node = self.deref_mut(ctx);
         node.set_next(head);
-        private::ContainsLinkedList::set_head(&mut (*container_ref), Some(*self));
         node.set_container(Some(container));
+        drop(node);
+        private::ContainsLinkedList::set_head(&mut (*container.deref_mut(ctx)), Some(*self));
     }
 
     /// Insert self as the tail of the list.
     pub fn insert_at_back(&self, container: Ptr<T::ContainerType>, ctx: &Context) {
-        let mut node = self.deref_mut(ctx);
-        assert!(
-            node.get_prev().is_none()
-                && node.get_next().is_none()
-                && node.get_container().is_none(),
-            "LinkedList node must be unlinked before relinking"
-        );
-        let mut container_ref = container.deref_mut(ctx);
-        let tail = container_ref.get_tail();
+        {
+            let node = self.deref(ctx);
+            assert!(
+                node.get_prev().is_none()
+                    && node.get_next().is_none()
+                    && node.get_container().is_none(),
+                "LinkedList node must be unlinked before relinking"
+            );
+        }
+        let (head, tail) = {
+            let container_ref = container.deref(ctx);
+            (container_ref.get_head(), container_ref.get_tail())
+        };
         match tail {
             Some(tail) => {
-                assert!(tail.deref(ctx).get_next().is_none());
-                tail.deref_mut(ctx).set_next(Some(*self));
+                let tail_ref = tail.deref(ctx);
+                assert!(tail_ref.get_next().is_none());
+                let tail_container = tail_ref
+                    .get_container()
+                    .expect("LinkedList node is missing its container");
+                drop(tail_ref);
+                drop(tail_container.deref(ctx));
+                assert!(tail_container == container);
             }
+            None => assert!(head.is_none()),
+        }
+
+        match tail {
+            Some(tail) => tail.deref_mut(ctx).set_next(Some(*self)),
             None => {
-                private::ContainsLinkedList::set_head(&mut (*container_ref), Some(*self));
+                private::ContainsLinkedList::set_head(&mut (*container.deref_mut(ctx)), Some(*self))
             }
         }
+        let mut node = self.deref_mut(ctx);
         node.set_prev(tail);
-        private::ContainsLinkedList::set_tail(&mut (*container_ref), Some(*self));
         node.set_container(Some(container));
+        drop(node);
+        private::ContainsLinkedList::set_tail(&mut (*container.deref_mut(ctx)), Some(*self));
     }
 
     /// Is this node part of a linked list?
@@ -290,12 +369,46 @@ where
 
     /// Unlink self from list.
     pub fn unlink(&self, ctx: &Context) {
-        let container = self
-            .deref(ctx)
-            .get_container()
-            .expect("LinkedList: Attempt to remove unlinked node");
-        let next = self.deref(ctx).get_next();
-        let prev = self.deref(ctx).get_prev();
+        let (container, next, prev) = {
+            let node = self.deref(ctx);
+            (
+                node.get_container()
+                    .expect("LinkedList: Attempt to remove unlinked node"),
+                node.get_next(),
+                node.get_prev(),
+            )
+        };
+        let (head, tail) = {
+            let container_ref = container.deref(ctx);
+            (container_ref.get_head(), container_ref.get_tail())
+        };
+        match next {
+            Some(next) => {
+                let next_ref = next.deref(ctx);
+                assert!(next_ref.get_prev() == Some(*self));
+                let next_container = next_ref
+                    .get_container()
+                    .expect("LinkedList node is missing its container");
+                drop(next_ref);
+                drop(next_container.deref(ctx));
+                assert!(next_container == container);
+            }
+            None => assert!(tail == Some(*self)),
+        }
+        match prev {
+            Some(prev) => {
+                let prev_ref = prev.deref(ctx);
+                assert!(prev_ref.get_next() == Some(*self));
+                let prev_container = prev_ref
+                    .get_container()
+                    .expect("LinkedList node is missing its container");
+                drop(prev_ref);
+                drop(prev_container.deref(ctx));
+                assert!(prev_container == container);
+            }
+            None => assert!(head == Some(*self)),
+        }
+
         match next {
             Some(next) => next.deref_mut(ctx).set_prev(prev),
             None => {

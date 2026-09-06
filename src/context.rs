@@ -658,22 +658,42 @@ mod mutation_epoch_tests {
             ops::ModuleOp,
             types::{IntegerType, Signedness, UnitType},
         },
-        linked_list::ContainsLinkedList,
+        linked_list::{ContainsLinkedList, LinkedList, append_linked_list},
         op::Op,
-        operation::Operation,
+        operation::{Operation, verify_operation},
         region::Region,
         r#type::TypeHandle,
         uniqued_any,
-        value::{DefiningEntity, Value},
+        value::{DefiningEntity, Use, Value},
     };
-    use alloc::vec;
-    use core::{num::NonZeroU64, panic::AssertUnwindSafe};
+    use alloc::{vec, vec::Vec};
+    use core::{marker::PhantomData, num::NonZeroU64, panic::AssertUnwindSafe};
 
     struct ArenaFixture {
         operation: Ptr<Operation>,
         region: Ptr<Region>,
         block: Ptr<BasicBlock>,
         value: Value,
+    }
+
+    #[derive(Eq, PartialEq)]
+    struct ArenaGraphSnapshot {
+        operation_count: usize,
+        region_count: usize,
+        block_count: usize,
+        value_counter: u64,
+        use_counter: u64,
+        operands: Vec<Value>,
+        successors: Vec<Ptr<BasicBlock>>,
+        regions: Vec<Ptr<Region>>,
+        operation_next: Option<Ptr<Operation>>,
+        operation_previous: Option<Ptr<Operation>>,
+        operation_container: Option<Ptr<BasicBlock>>,
+        region_parent: Ptr<Operation>,
+        region_head: Option<Ptr<BasicBlock>>,
+        region_tail: Option<Ptr<BasicBlock>>,
+        block_uses: Vec<Use<Ptr<BasicBlock>>>,
+        value_uses: Vec<Use<Value>>,
     }
 
     fn arena_fixture(context: &mut Context, name: &str) -> ArenaFixture {
@@ -699,6 +719,10 @@ mod mutation_epoch_tests {
             .is_some()
     }
 
+    fn is_dangling_pointer_error(error: &crate::result::Error) -> bool {
+        error.err.downcast_ref::<DanglingPtrDerefError>().is_some()
+    }
+
     fn expect_error<T>(result: crate::result::Result<T>) -> crate::result::Error {
         match result {
             Ok(_) => panic!("expected operation to fail"),
@@ -708,6 +732,59 @@ mod mutation_epoch_tests {
 
     fn epoch(ctx: &Context) -> u64 {
         ctx.ir_mutation_attempt_epoch().unwrap().value()
+    }
+
+    fn graph_snapshot(context: &Context, fixture: &ArenaFixture) -> ArenaGraphSnapshot {
+        let operation = fixture.operation.deref(context);
+        let operands = operation.operands().collect();
+        let successors = operation.successors().collect();
+        let regions = operation.regions().collect();
+        let operation_next = operation.get_next();
+        let operation_previous = operation.get_prev();
+        let operation_container = operation.get_container();
+        drop(operation);
+
+        let region = fixture.region.deref(context);
+        let region_parent = region.get_parent_op();
+        let region_head = region.get_head();
+        let region_tail = region.get_tail();
+        drop(region);
+
+        ArenaGraphSnapshot {
+            operation_count: context.operations.len(),
+            region_count: context.regions.len(),
+            block_count: context.basic_blocks.len(),
+            value_counter: context.value_counter.get(),
+            use_counter: context.use_counter.get(),
+            operands,
+            successors,
+            regions,
+            operation_next,
+            operation_previous,
+            operation_container,
+            region_parent,
+            region_head,
+            region_tail,
+            block_uses: fixture.block.uses(context),
+            value_uses: fixture.value.uses(context),
+        }
+    }
+
+    macro_rules! assert_foreign_mutation_rejected {
+        ($owner:ident, $owner_fixture:ident, $foreign:ident, $foreign_fixture:ident, $action:block) => {{
+            let owner_epoch = epoch(&$owner);
+            let foreign_epoch = epoch(&$foreign);
+            let owner_graph = graph_snapshot(&$owner, &$owner_fixture);
+            let foreign_graph = graph_snapshot(&$foreign, &$foreign_fixture);
+            assert!(
+                std::panic::catch_unwind(AssertUnwindSafe(|| $action)).is_err(),
+                "foreign composite mutation unexpectedly succeeded"
+            );
+            assert_eq!(epoch(&$owner), owner_epoch);
+            assert_eq!(epoch(&$foreign), foreign_epoch);
+            assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
+            assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
+        }};
     }
 
     #[test]
@@ -789,6 +866,35 @@ mod mutation_epoch_tests {
         );
     }
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn concurrent_context_identity_allocation_is_unique_and_nonzero() {
+        const THREADS: usize = 8;
+        const CONTEXTS_PER_THREAD: usize = 64;
+
+        let mut workers = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            workers.push(std::thread::spawn(|| {
+                let mut identities = Vec::with_capacity(CONTEXTS_PER_THREAD);
+                for _ in 0..CONTEXTS_PER_THREAD {
+                    let context = Context::try_new().unwrap();
+                    identities.push(context.identity.0.get());
+                }
+                identities
+            }));
+        }
+
+        let mut identities = Vec::with_capacity(THREADS * CONTEXTS_PER_THREAD);
+        for worker in workers {
+            identities.extend(worker.join().unwrap());
+        }
+        assert!(identities.iter().all(|identity| *identity != 0));
+        identities.sort_unstable();
+        let original_len = identities.len();
+        identities.dedup();
+        assert_eq!(identities.len(), original_len);
+    }
+
     #[test]
     fn equal_slot_operations_regions_blocks_and_values_reject_foreign_contexts() {
         let mut owner = Context::try_new().unwrap();
@@ -841,6 +947,157 @@ mod mutation_epoch_tests {
         assert_eq!(epoch(&foreign), before);
         assert!(foreign_fixture.operation.try_deref(&foreign).is_ok());
         assert!(owner_fixture.operation.try_deref(&owner).is_ok());
+    }
+
+    #[test]
+    fn equal_slot_composite_mutators_reject_before_changing_either_context() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+
+        assert_eq!(owner_fixture.operation.idx, foreign_fixture.operation.idx);
+        assert_eq!(owner_fixture.region.idx, foreign_fixture.region.idx);
+        assert_eq!(owner_fixture.block.idx, foreign_fixture.block.idx);
+        let owner_value_block = owner_fixture.value.defining_block().unwrap();
+        let foreign_value_block = foreign_fixture.value.defining_block().unwrap();
+        assert_eq!(owner_value_block.idx, foreign_value_block.idx);
+        let owner_type: TypeHandle = IntegerType::get(&owner, 32, Signedness::Signless).into();
+
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::push_result(foreign_fixture.operation, &owner, owner_type);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::insert_result(foreign_fixture.operation, &owner, 0, owner_type);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            BasicBlock::push_argument(foreign_fixture.block, &owner, owner_type);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            BasicBlock::insert_argument(foreign_fixture.block, &owner, 0, owner_type);
+        });
+
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::push_operand(owner_fixture.operation, &owner, foreign_fixture.value);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::push_operand(foreign_fixture.operation, &owner, owner_fixture.value);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::insert_operand(owner_fixture.operation, &owner, 0, foreign_fixture.value);
+        });
+
+        Operation::push_operand(owner_fixture.operation, &owner, owner_fixture.value);
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::replace_operand(owner_fixture.operation, &owner, 0, foreign_fixture.value);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            owner_fixture
+                .value
+                .replace_all_uses_with(&owner, &foreign_fixture.value);
+        });
+
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::push_successor(owner_fixture.operation, &owner, foreign_fixture.block);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::insert_successor(owner_fixture.operation, &owner, 0, foreign_fixture.block);
+        });
+
+        Operation::push_successor(owner_fixture.operation, &owner, owner_fixture.block);
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::replace_successor(owner_fixture.operation, &owner, 0, foreign_fixture.block);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            owner_fixture
+                .block
+                .retarget_all_preds_to(&owner, foreign_fixture.block);
+        });
+
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::new(
+                &mut owner,
+                ModuleOp::get_concrete_op_info(),
+                vec![],
+                vec![foreign_fixture.value],
+                vec![foreign_fixture.block],
+                0,
+            );
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::add_region(foreign_fixture.operation, &mut owner);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Region::move_to_op(owner_fixture.region, foreign_fixture.operation, &owner);
+        });
+
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            owner_fixture
+                .operation
+                .insert_at_back(foreign_fixture.block, &owner);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            owner_fixture
+                .operation
+                .insert_after(&owner, foreign_fixture.operation);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            append_linked_list(owner_fixture.region, foreign_fixture.region, &owner);
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            append_linked_list(foreign_fixture.region, owner_fixture.region, &owner);
+        });
+    }
+
+    #[test]
+    fn result_returning_queries_report_foreign_and_dangling_user_pointers() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        assert_eq!(owner_fixture.operation.idx, foreign_fixture.operation.idx);
+
+        Operation::push_operand(owner_fixture.operation, &owner, owner_fixture.value);
+        let value_use = owner_fixture.operation.deref(&owner).get_operand_as_use(0);
+        let error = expect_error(value_use.try_find_index(&foreign));
+        assert!(is_foreign_context_error(&error));
+
+        Operation::push_successor(owner_fixture.operation, &owner, owner_fixture.block);
+        let successor_use = owner_fixture
+            .operation
+            .deref(&owner)
+            .get_successor_as_use(0);
+        let error = expect_error(successor_use.try_find_index(&foreign));
+        assert!(is_foreign_context_error(&error));
+
+        let error = expect_error(verify_operation(owner_fixture.operation, &foreign));
+        assert!(is_foreign_context_error(&error));
+
+        let dangling = Operation::new(
+            &mut owner,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        );
+        ArenaObj::dealloc(dangling, &mut owner);
+        let dangling_value_use = Use::<Value> {
+            user_op: dangling,
+            use_uid: u64::MAX,
+            _dummy: PhantomData,
+        };
+        let error = expect_error(dangling_value_use.try_find_index(&owner));
+        assert!(is_dangling_pointer_error(&error));
+        let dangling_successor_use = Use::<Ptr<BasicBlock>> {
+            user_op: dangling,
+            use_uid: u64::MAX,
+            _dummy: PhantomData,
+        };
+        let error = expect_error(dangling_successor_use.try_find_index(&owner));
+        assert!(is_dangling_pointer_error(&error));
+        let error = expect_error(verify_operation(dangling, &owner));
+        assert!(is_dangling_pointer_error(&error));
     }
 
     #[test]
