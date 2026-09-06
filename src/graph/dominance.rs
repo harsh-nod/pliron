@@ -335,6 +335,8 @@ impl DomInfo {
         ctx: &Context,
         region: Ptr<Region>,
     ) -> &DomTree<Ptr<Region>, Context> {
+        Operation::try_preflight_region_tree(region, ctx)
+            .expect("Dominator-tree region preflight failed");
         self.0
             .entry(region)
             .or_insert_with(|| compute_dominator_tree(ctx, &region))
@@ -844,6 +846,74 @@ mod tests {
         op::Op,
         operation::Operation,
     };
+    use core::panic::AssertUnwindSafe;
+
+    #[test]
+    fn equal_slot_foreign_region_does_not_change_dominance_cache_or_contexts() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_module = ModuleOp::new(&mut owner, "owner".try_into().unwrap());
+        let foreign_module = ModuleOp::new(&mut foreign, "foreign".try_into().unwrap());
+        let owner_region = owner_module.get_region(&owner);
+        let foreign_region = foreign_module.get_region(&foreign);
+        assert_eq!(owner_region.idx, foreign_region.idx);
+        let owner_before = (
+            owner.operations.len(),
+            owner.regions.len(),
+            owner.basic_blocks.len(),
+            owner.value_counter.get(),
+            owner.use_counter.get(),
+            owner.ir_mutation_attempt_epoch().unwrap().value(),
+            owner_region.deref(&owner).get_head(),
+            owner_region.deref(&owner).get_tail(),
+        );
+        let foreign_before = (
+            foreign.operations.len(),
+            foreign.regions.len(),
+            foreign.basic_blocks.len(),
+            foreign.value_counter.get(),
+            foreign.use_counter.get(),
+            foreign.ir_mutation_attempt_epoch().unwrap().value(),
+            foreign_region.deref(&foreign).get_head(),
+            foreign_region.deref(&foreign).get_tail(),
+        );
+        let mut info = DomInfo::default();
+        let cache_before = (info.0.len(), info.0.capacity());
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = info.get_dom_tree(&owner, foreign_region);
+            }))
+            .is_err()
+        );
+        assert_eq!((info.0.len(), info.0.capacity()), cache_before);
+        assert_eq!(
+            (
+                owner.operations.len(),
+                owner.regions.len(),
+                owner.basic_blocks.len(),
+                owner.value_counter.get(),
+                owner.use_counter.get(),
+                owner.ir_mutation_attempt_epoch().unwrap().value(),
+                owner_region.deref(&owner).get_head(),
+                owner_region.deref(&owner).get_tail(),
+            ),
+            owner_before
+        );
+        assert_eq!(
+            (
+                foreign.operations.len(),
+                foreign.regions.len(),
+                foreign.basic_blocks.len(),
+                foreign.value_counter.get(),
+                foreign.use_counter.get(),
+                foreign.ir_mutation_attempt_epoch().unwrap().value(),
+                foreign_region.deref(&foreign).get_head(),
+                foreign_region.deref(&foreign).get_tail(),
+            ),
+            foreign_before
+        );
+    }
 
     /// A test-only terminator operation for setting up CFG edges.
     #[pliron_op(

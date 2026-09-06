@@ -557,6 +557,8 @@ pub fn mem2reg(
     ctx: &mut Context,
     analyses: &mut AnalysisManager,
 ) -> Result<IRStatus> {
+    Operation::try_preflight_tree(root, ctx)?;
+
     // Collect allocations that implement the promotable allocation interface.
     let mut candidates = collect_alloc_candidates(root, ctx);
     // Prune candidates that we cannot promote based on their uses.

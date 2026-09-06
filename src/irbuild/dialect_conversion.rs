@@ -172,6 +172,8 @@ pub fn apply_dialect_conversion<C: DialectConversion>(
     conversion: &mut C,
     op: Ptr<Operation>,
 ) -> Result<IRStatus> {
+    Operation::try_preflight_tree(op, ctx)?;
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum OpState {
         Queued,

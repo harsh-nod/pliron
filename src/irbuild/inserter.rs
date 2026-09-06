@@ -12,6 +12,7 @@ use crate::{
     context::{Context, Ptr},
     identifier::Identifier,
     irbuild::listener::InsertionListener,
+    linked_list::{ContainsLinkedList, try_preflight_linked_list},
     op::Op,
     operation::Operation,
     printable::{self, Printable},
@@ -111,10 +112,17 @@ impl OpInsertionPoint {
     pub(crate) fn preflight(&self, ctx: &Context) {
         match self {
             OpInsertionPoint::AtBlockStart(block) | OpInsertionPoint::AtBlockEnd(block) => {
-                drop(block.deref(ctx));
+                try_preflight_linked_list(*block, ctx)
+                    .expect("Operation insertion block preflight failed");
             }
             OpInsertionPoint::AfterOperation(op) | OpInsertionPoint::BeforeOperation(op) => {
-                drop(op.deref(ctx));
+                let block = op
+                    .deref(ctx)
+                    .get_parent_block()
+                    .expect("Operation insertion mark is unlinked");
+                try_preflight_linked_list(block, ctx)
+                    .expect("Operation insertion block preflight failed");
+                assert!(block.deref(ctx).iter(ctx).any(|candidate| candidate == *op));
             }
             OpInsertionPoint::Unset => panic!("Insertion point is not set"),
         }
@@ -142,10 +150,22 @@ impl BlockInsertionPoint {
         match self {
             BlockInsertionPoint::AtRegionStart(region)
             | BlockInsertionPoint::AtRegionEnd(region) => {
-                drop(region.deref(ctx));
+                try_preflight_linked_list(*region, ctx)
+                    .expect("Block insertion region preflight failed");
             }
             BlockInsertionPoint::AfterBlock(block) | BlockInsertionPoint::BeforeBlock(block) => {
-                drop(block.deref(ctx));
+                let region = block
+                    .deref(ctx)
+                    .get_parent_region()
+                    .expect("Block insertion mark is unlinked");
+                try_preflight_linked_list(region, ctx)
+                    .expect("Block insertion region preflight failed");
+                assert!(
+                    region
+                        .deref(ctx)
+                        .iter(ctx)
+                        .any(|candidate| candidate == *block)
+                );
             }
             BlockInsertionPoint::Unset => panic!("Block insertion point is not set"),
         }
@@ -359,9 +379,21 @@ impl<L: InsertionListener> Inserter for IRInserter<L> {
     }
 
     fn insert_operation(&mut self, ctx: &Context, operation: Ptr<Operation>) {
+        Operation::try_preflight_tree(operation, ctx)
+            .expect("Inserted operation tree preflight failed");
+        self.op_insertion_point.preflight(ctx);
         assert!(
             !operation.is_linked(ctx),
             "Cannot insert an already linked operation"
+        );
+        let insertion_block = self
+            .op_insertion_point
+            .get_insertion_block(ctx)
+            .expect("Insertion point is not set");
+        assert!(
+            !Operation::try_block_is_inside_operation(insertion_block, operation, ctx)
+                .expect("Operation insertion containment preflight failed"),
+            "Cannot insert an operation into its own subtree"
         );
         match self.op_insertion_point {
             OpInsertionPoint::AtBlockStart(block) => {
@@ -400,6 +432,21 @@ impl<L: InsertionListener> Inserter for IRInserter<L> {
         insertion_point: BlockInsertionPoint,
         block: Ptr<BasicBlock>,
     ) {
+        Operation::try_preflight_block_tree(block, ctx)
+            .expect("Inserted block tree preflight failed");
+        insertion_point.preflight(ctx);
+        assert!(
+            !block.is_linked(ctx),
+            "Cannot insert an already linked block"
+        );
+        let insertion_region = insertion_point
+            .get_insertion_region(ctx)
+            .expect("Insertion point is not set");
+        assert!(
+            !Operation::try_region_is_inside_block(insertion_region, block, ctx)
+                .expect("Block insertion containment preflight failed"),
+            "Cannot insert a block into its own subtree"
+        );
         match insertion_point {
             BlockInsertionPoint::AtRegionStart(region) => {
                 block.insert_at_front(region, ctx);

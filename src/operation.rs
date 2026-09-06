@@ -32,7 +32,7 @@ use crate::{
         parsers::{list_parser, location, spaced},
         printers::iter_with_sep,
     },
-    linked_list::{LinkedList, private},
+    linked_list::{ContainsLinkedList, LinkedList, private, try_preflight_linked_list},
     location::{Located, Location},
     op::{ConcreteOpInfo, Op, OpId, OpObj, op_cast, op_impls},
     parsable::{self, Parsable, ParseResult, StateStream},
@@ -41,7 +41,7 @@ use crate::{
     result::Result,
     r#type::{TypeHandle, Typed},
     utils::vec_exns::VecExtns,
-    value::{DefNode, DefTrait, DefUseParticipant, DefiningEntity, Use, UseNode, Value},
+    value::{DefNode, DefTrait, DefUseParticipant, DefiningEntity, Use, UseNode, UseTrait, Value},
     verify_err, verify_error,
 };
 
@@ -161,7 +161,427 @@ impl LinkedList for Operation {
     }
 }
 
+#[derive(Clone, Copy)]
+enum EraseScope {
+    Operation(Ptr<Operation>),
+    Block(Ptr<BasicBlock>),
+    Region(Ptr<Region>),
+}
+
+#[derive(Clone, Copy)]
+enum ResultUsePolicy {
+    Reject,
+    Allow,
+    RequireInside,
+}
+
 impl Operation {
+    /// Authenticate an operation and the complete IR tree nested under it without
+    /// allocating or mutating context-owned state.
+    pub(crate) fn try_preflight_tree(ptr: Ptr<Self>, ctx: &Context) -> Result<()> {
+        let parent_block = ptr.try_deref(ctx)?.get_parent_block();
+        if let Some(parent_block) = parent_block {
+            try_preflight_linked_list(parent_block, ctx)?;
+            assert!(
+                parent_block
+                    .try_deref(ctx)?
+                    .iter(ctx)
+                    .filter(|operation| *operation == ptr)
+                    .count()
+                    == 1
+            );
+        }
+        let mut remaining_operations = ctx.operations.len();
+        Self::try_preflight_operation_tree(ptr, ctx, &mut remaining_operations)
+    }
+
+    /// Authenticate a region and the complete IR tree nested under it without
+    /// allocating or mutating context-owned state.
+    pub(crate) fn try_preflight_region_tree(ptr: Ptr<Region>, ctx: &Context) -> Result<()> {
+        let mut remaining_operations = ctx.operations.len();
+        Self::try_preflight_region_tree_impl(ptr, ctx, &mut remaining_operations)
+    }
+
+    /// Authenticate a block and the complete IR tree nested under it without
+    /// allocating or mutating context-owned state.
+    pub(crate) fn try_preflight_block_tree(ptr: Ptr<BasicBlock>, ctx: &Context) -> Result<()> {
+        let parent_region = ptr.try_deref(ctx)?.get_parent_region();
+        if let Some(parent_region) = parent_region {
+            try_preflight_linked_list(parent_region, ctx)?;
+            assert!(
+                parent_region
+                    .try_deref(ctx)?
+                    .iter(ctx)
+                    .filter(|block| *block == ptr)
+                    .count()
+                    == 1
+            );
+        }
+        let mut remaining_operations = ctx.operations.len();
+        Self::try_preflight_block_tree_impl(ptr, ctx, &mut remaining_operations)
+    }
+
+    fn try_preflight_operation_tree(
+        ptr: Ptr<Self>,
+        ctx: &Context,
+        remaining_operations: &mut usize,
+    ) -> Result<()> {
+        let operation = ptr.try_deref(ctx)?;
+        assert!(
+            *remaining_operations > 0,
+            "Operation containment contains a cycle"
+        );
+        *remaining_operations -= 1;
+
+        assert!(operation.self_ptr == ptr);
+        for (result_index, result) in operation.results.iter().enumerate() {
+            let value = result.as_value(ptr);
+            assert!(value.try_find_index(ctx)? == result_index);
+            for r#use in result.def.uses() {
+                <Value as UseTrait>::try_find_index(&r#use, ctx)?;
+                assert!(r#use.get_def(ctx) == value);
+            }
+        }
+        for (operand_index, operand) in operation.operands.iter().enumerate() {
+            operand.get_def().try_find_index(ctx)?;
+            let r#use = operand.as_use(ptr);
+            assert!(<Value as UseTrait>::try_find_index(&r#use, ctx)? == operand_index);
+            operand.verify(ctx, ptr)?;
+        }
+        for (successor_index, successor) in operation.successors.iter().enumerate() {
+            drop(successor.get_def().try_deref(ctx)?);
+            let r#use = successor.as_use(ptr);
+            assert!(<Ptr<BasicBlock> as UseTrait>::try_find_index(&r#use, ctx)? == successor_index);
+            successor.verify(ctx, ptr)?;
+        }
+        let num_regions = operation.regions.len();
+        drop(operation);
+
+        for region_index in 0..num_regions {
+            let region = ptr.try_deref(ctx)?.regions[region_index];
+            assert!(region.try_deref(ctx)?.get_parent_op() == ptr);
+            Self::try_preflight_region_tree_impl(region, ctx, remaining_operations)?;
+        }
+        Ok(())
+    }
+
+    fn try_preflight_region_tree_impl(
+        ptr: Ptr<Region>,
+        ctx: &Context,
+        remaining_operations: &mut usize,
+    ) -> Result<()> {
+        let region = ptr.try_deref(ctx)?;
+        let parent_op = region.get_parent_op();
+        let parent_op_ref = parent_op.try_deref(ctx)?;
+        assert!(
+            parent_op_ref
+                .regions
+                .iter()
+                .filter(|region| **region == ptr)
+                .count()
+                == 1
+        );
+        drop(parent_op_ref);
+        drop(region);
+
+        try_preflight_linked_list(ptr, ctx)?;
+        let mut block = ptr.try_deref(ctx)?.get_head();
+        while let Some(current_block) = block {
+            let block_ref = current_block.try_deref(ctx)?;
+            assert!(block_ref.get_parent_region() == Some(ptr));
+            block = block_ref.get_next();
+            drop(block_ref);
+            Self::try_preflight_block_tree_impl(current_block, ctx, remaining_operations)?;
+        }
+        Ok(())
+    }
+
+    fn try_preflight_block_tree_impl(
+        ptr: Ptr<BasicBlock>,
+        ctx: &Context,
+        remaining_operations: &mut usize,
+    ) -> Result<()> {
+        let block = ptr.try_deref(ctx)?;
+        assert!(block.self_ptr == ptr);
+        for (argument_index, argument) in block.args.iter().enumerate() {
+            let value = argument.as_value(ptr);
+            assert!(value.try_find_index(ctx)? == argument_index);
+            for r#use in argument.def.uses() {
+                <Value as UseTrait>::try_find_index(&r#use, ctx)?;
+                assert!(r#use.get_def(ctx) == value);
+            }
+        }
+        for r#use in block.preds.uses() {
+            <Ptr<BasicBlock> as UseTrait>::try_find_index(&r#use, ctx)?;
+            assert!(r#use.get_def(ctx) == ptr);
+        }
+        drop(block);
+        try_preflight_linked_list(ptr, ctx)?;
+        let mut operation = ptr.try_deref(ctx)?.get_head();
+        while let Some(current_operation) = operation {
+            let operation_ref = current_operation.try_deref(ctx)?;
+            assert!(operation_ref.get_parent_block() == Some(ptr));
+            operation = operation_ref.get_next();
+            drop(operation_ref);
+            Self::try_preflight_operation_tree(current_operation, ctx, remaining_operations)?;
+        }
+        Ok(())
+    }
+
+    /// Authenticate the complete subtree and reject result, block-argument,
+    /// or CFG uses whose users will survive erasing `ptr`.
+    pub(crate) fn try_preflight_erase_tree(ptr: Ptr<Self>, ctx: &Context) -> Result<()> {
+        Self::try_preflight_tree(ptr, ctx)?;
+        Self::try_preflight_erase_operation(
+            ptr,
+            EraseScope::Operation(ptr),
+            ResultUsePolicy::Reject,
+            ctx,
+        )
+    }
+
+    /// Authenticate the complete subtree and reject definitions used outside
+    /// the block before any outgoing use is removed.
+    pub(crate) fn try_preflight_erase_block(ptr: Ptr<BasicBlock>, ctx: &Context) -> Result<()> {
+        Self::try_preflight_block_tree(ptr, ctx)?;
+        Self::try_preflight_erase_block_impl(ptr, EraseScope::Block(ptr), ctx)
+    }
+
+    /// Authenticate the complete subtree and reject definitions used outside
+    /// the region before any outgoing use is removed.
+    pub(crate) fn try_preflight_erase_region(ptr: Ptr<Region>, ctx: &Context) -> Result<()> {
+        Self::try_preflight_region_tree(ptr, ctx)?;
+        Self::try_preflight_erase_region_impl(ptr, EraseScope::Region(ptr), ctx)
+    }
+
+    /// Preflight replacing all root results while requiring every nested
+    /// definition to have no users outside the operation being replaced.
+    pub(crate) fn try_preflight_replacement(
+        ptr: Ptr<Self>,
+        new_values: &[Value],
+        ctx: &Context,
+    ) -> Result<()> {
+        Self::try_preflight_tree(ptr, ctx)?;
+        assert!(ptr.try_deref(ctx)?.get_num_results() == new_values.len());
+        for value in new_values {
+            Self::try_preflight_value(*value, ctx)?;
+            assert!(
+                !Self::try_value_definition_is_inside_erase_scope(
+                    *value,
+                    EraseScope::Operation(ptr),
+                    ctx,
+                )?,
+                "Replacement value is defined inside the operation being erased"
+            );
+        }
+        Self::try_preflight_erase_operation(
+            ptr,
+            EraseScope::Operation(ptr),
+            ResultUsePolicy::Allow,
+            ctx,
+        )
+    }
+
+    /// Preflight replacing `ptr` with the results of `new_op` without
+    /// allocating a temporary result vector.
+    pub(crate) fn try_preflight_operation_replacement(
+        ptr: Ptr<Self>,
+        new_op: Ptr<Self>,
+        ctx: &Context,
+    ) -> Result<()> {
+        Self::try_preflight_tree(ptr, ctx)?;
+        Self::try_preflight_tree(new_op, ctx)?;
+        assert!(ptr.try_deref(ctx)?.get_num_results() == new_op.try_deref(ctx)?.get_num_results());
+        assert!(
+            !Self::try_user_is_inside_erase_scope(new_op, EraseScope::Operation(ptr), ctx,)?,
+            "Replacement operation is nested inside the operation being erased"
+        );
+        Self::try_preflight_erase_operation(
+            ptr,
+            EraseScope::Operation(ptr),
+            ResultUsePolicy::Allow,
+            ctx,
+        )
+    }
+
+    /// Authenticate a value and every reciprocal edge in its use list.
+    pub(crate) fn try_preflight_value(value: Value, ctx: &Context) -> Result<()> {
+        value.try_find_index(ctx)?;
+        for r#use in value.get_defnode_ref(ctx).uses() {
+            <Value as UseTrait>::try_find_index(&r#use, ctx)?;
+            assert!(r#use.get_def(ctx) == value);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_block_is_inside_operation(
+        block: Ptr<BasicBlock>,
+        root: Ptr<Operation>,
+        ctx: &Context,
+    ) -> Result<bool> {
+        drop(block.try_deref(ctx)?);
+        let Some(region) = block.try_deref(ctx)?.get_parent_region() else {
+            return Ok(false);
+        };
+        let parent_op = region.try_deref(ctx)?.get_parent_op();
+        Self::try_user_is_inside_erase_scope(parent_op, EraseScope::Operation(root), ctx)
+    }
+
+    pub(crate) fn try_region_is_inside_block(
+        region: Ptr<Region>,
+        root: Ptr<BasicBlock>,
+        ctx: &Context,
+    ) -> Result<bool> {
+        let parent_op = region.try_deref(ctx)?.get_parent_op();
+        Self::try_user_is_inside_erase_scope(parent_op, EraseScope::Block(root), ctx)
+    }
+
+    pub(crate) fn try_region_is_inside_region(
+        region: Ptr<Region>,
+        root: Ptr<Region>,
+        ctx: &Context,
+    ) -> Result<bool> {
+        let parent_op = region.try_deref(ctx)?.get_parent_op();
+        Self::try_user_is_inside_erase_scope(parent_op, EraseScope::Region(root), ctx)
+    }
+
+    fn try_preflight_erase_operation(
+        ptr: Ptr<Self>,
+        scope: EraseScope,
+        result_use_policy: ResultUsePolicy,
+        ctx: &Context,
+    ) -> Result<()> {
+        let operation = ptr.try_deref(ctx)?;
+        for result in &operation.results {
+            for r#use in result.def.uses() {
+                <Value as UseTrait>::try_find_index(&r#use, ctx)?;
+                assert!(
+                    match result_use_policy {
+                        ResultUsePolicy::Reject => false,
+                        ResultUsePolicy::Allow => true,
+                        ResultUsePolicy::RequireInside => {
+                            Self::try_user_is_inside_erase_scope(r#use.user_op(), scope, ctx)?
+                        }
+                    },
+                    "Operation result has a use outside the erased IR"
+                );
+            }
+        }
+        let num_regions = operation.regions.len();
+        drop(operation);
+        for region_index in 0..num_regions {
+            let region = ptr.try_deref(ctx)?.regions[region_index];
+            Self::try_preflight_erase_region_impl(region, scope, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn try_preflight_erase_region_impl(
+        ptr: Ptr<Region>,
+        scope: EraseScope,
+        ctx: &Context,
+    ) -> Result<()> {
+        let mut block = ptr.try_deref(ctx)?.get_head();
+        while let Some(current_block) = block {
+            block = current_block.try_deref(ctx)?.get_next();
+            Self::try_preflight_erase_block_impl(current_block, scope, ctx)?;
+        }
+        Ok(())
+    }
+
+    fn try_preflight_erase_block_impl(
+        ptr: Ptr<BasicBlock>,
+        scope: EraseScope,
+        ctx: &Context,
+    ) -> Result<()> {
+        let block = ptr.try_deref(ctx)?;
+        for r#use in block.preds.uses() {
+            <Ptr<BasicBlock> as UseTrait>::try_find_index(&r#use, ctx)?;
+            assert!(
+                Self::try_user_is_inside_erase_scope(r#use.user_op(), scope, ctx)?,
+                "Basic block has a predecessor outside the erased IR"
+            );
+        }
+        for argument in &block.args {
+            for r#use in argument.def.uses() {
+                <Value as UseTrait>::try_find_index(&r#use, ctx)?;
+                assert!(
+                    Self::try_user_is_inside_erase_scope(r#use.user_op(), scope, ctx)?,
+                    "Block argument has a use outside the erased IR"
+                );
+            }
+        }
+        let mut operation = block.get_head();
+        drop(block);
+        while let Some(current_operation) = operation {
+            operation = current_operation.try_deref(ctx)?.get_next();
+            Self::try_preflight_erase_operation(
+                current_operation,
+                scope,
+                ResultUsePolicy::RequireInside,
+                ctx,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn try_user_is_inside_erase_scope(
+        user: Ptr<Operation>,
+        scope: EraseScope,
+        ctx: &Context,
+    ) -> Result<bool> {
+        let mut current = user;
+        for _ in 0..=ctx.operations.len() {
+            if matches!(scope, EraseScope::Operation(root) if current == root) {
+                return Ok(true);
+            }
+            let Some(block) = current.try_deref(ctx)?.get_parent_block() else {
+                return Ok(false);
+            };
+            drop(block.try_deref(ctx)?);
+            if matches!(scope, EraseScope::Block(root) if block == root) {
+                return Ok(true);
+            }
+            let Some(region) = block.try_deref(ctx)?.get_parent_region() else {
+                return Ok(false);
+            };
+            let region_ref = region.try_deref(ctx)?;
+            if matches!(scope, EraseScope::Region(root) if region == root) {
+                return Ok(true);
+            }
+            current = region_ref.get_parent_op();
+            drop(region_ref);
+            drop(current.try_deref(ctx)?);
+        }
+        panic!("Operation containment contains a cycle")
+    }
+
+    fn try_value_definition_is_inside_erase_scope(
+        value: Value,
+        scope: EraseScope,
+        ctx: &Context,
+    ) -> Result<bool> {
+        match value.defining_entity() {
+            DefiningEntity::Op(op) => Self::try_user_is_inside_erase_scope(op, scope, ctx),
+            DefiningEntity::Block(block) => {
+                drop(block.try_deref(ctx)?);
+                if matches!(scope, EraseScope::Block(root) if block == root) {
+                    return Ok(true);
+                }
+                let Some(region) = block.try_deref(ctx)?.get_parent_region() else {
+                    return Ok(false);
+                };
+                let region_ref = region.try_deref(ctx)?;
+                if matches!(scope, EraseScope::Region(root) if region == root) {
+                    return Ok(true);
+                }
+                let parent_op = region_ref.get_parent_op();
+                drop(region_ref);
+                Self::try_user_is_inside_erase_scope(parent_op, scope, ctx)
+            }
+        }
+    }
+
     /// Create a new, unlinked (i.e., not in a basic block) operation.
     pub fn new(
         ctx: &mut Context,
@@ -540,8 +960,10 @@ impl Operation {
     /// Erase `reg_idx`'th region. Affects the index of all regions after it.
     /// Panics on invalid index.
     pub fn erase_region(ptr: Ptr<Self>, ctx: &mut Context, reg_idx: usize) {
+        Self::try_preflight_tree(ptr, ctx).expect("Operation region erase preflight failed");
         let reg = ptr.deref(ctx).regions[reg_idx];
-        Region::drop_all_uses(reg, ctx);
+        Self::try_preflight_erase_region(reg, ctx).expect("Region erase legality preflight failed");
+        Region::drop_all_uses_preflighted(reg, ctx);
         ptr.deref_mut(ctx).regions.remove(reg_idx);
         ArenaObj::dealloc(reg, ctx);
     }
@@ -559,6 +981,11 @@ impl Operation {
 
     /// Drop all uses that this operation holds.
     pub fn drop_all_uses(ptr: Ptr<Self>, ctx: &Context) {
+        Self::try_preflight_tree(ptr, ctx).expect("Operation use-drop preflight failed");
+        Self::drop_all_uses_preflighted(ptr, ctx);
+    }
+
+    pub(crate) fn drop_all_uses_preflighted(ptr: Ptr<Self>, ctx: &Context) {
         {
             let operation = ptr.deref(ctx);
             for operand in &operation.operands {
@@ -585,23 +1012,15 @@ impl Operation {
 
         let regions = ptr.deref(ctx).regions.clone();
         for region in regions {
-            Region::drop_all_uses(region, ctx);
+            Region::drop_all_uses_preflighted(region, ctx);
         }
     }
 
     /// Unlink and deallocate this operation and everything that it contains.
     /// Panics if there are any uses of this operation.
     pub fn erase(ptr: Ptr<Self>, ctx: &mut Context) {
-        Self::drop_all_uses(ptr, ctx);
-        assert!(
-            !ptr.deref(ctx).has_use(),
-            "Operation {} with use in {} being erased",
-            OpDbg { op: ptr, ctx },
-            OpDbg {
-                op: ptr.deref(ctx).uses().next().unwrap().user_op,
-                ctx
-            }
-        );
+        Self::try_preflight_erase_tree(ptr, ctx).expect("Operation erase preflight failed");
+        Self::drop_all_uses_preflighted(ptr, ctx);
         if ptr.is_linked(ctx) {
             ptr.unlink(ctx);
         }

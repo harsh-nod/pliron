@@ -27,7 +27,7 @@ use crate::{
     linked_list::{ContainsLinkedList, LinkedList, private},
     location::{Located, Location},
     op::op_impls,
-    operation::{DefUseVerifyErr, OpDbg, Operation, OperationParserConfig},
+    operation::{DefUseVerifyErr, Operation, OperationParserConfig},
     parsable::{self, IntoParseResult, Parsable, ParseResult},
     printable::{self, ListSeparator, Printable, indented_nl},
     region::Region,
@@ -280,29 +280,22 @@ impl BasicBlock {
 
     /// Drop all uses that this block holds.
     pub fn drop_all_uses(ptr: Ptr<Self>, ctx: &Context) {
+        Operation::try_preflight_block_tree(ptr, ctx).expect("Block use-drop preflight failed");
+        Self::drop_all_uses_preflighted(ptr, ctx);
+    }
+
+    pub(crate) fn drop_all_uses_preflighted(ptr: Ptr<Self>, ctx: &Context) {
         let ops: Vec<_> = ptr.deref(ctx).iter(ctx).collect();
         for op in ops {
-            Operation::drop_all_uses(op, ctx);
+            Operation::drop_all_uses_preflighted(op, ctx);
         }
     }
 
     /// Unlink and deallocate this block and everything that it contains.
     /// Panics if there are any uses outside the block.
     pub fn erase(ptr: Ptr<Self>, ctx: &mut Context) {
-        Self::drop_all_uses(ptr, ctx);
-        assert!(
-            !ptr.has_pred(ctx),
-            "BasicBlock {} with predecessor {} being erased",
-            ptr.deref(ctx).unique_name(ctx),
-            ptr.preds(ctx).first().unwrap().deref(ctx).unique_name(ctx)
-        );
-        if let Some(op) = ptr.deref(ctx).iter(ctx).find(|op| op.deref(ctx).has_use()) {
-            panic!(
-                "Attemping to erase block {} which contains {} with use outside the block",
-                ptr.deref(ctx).unique_name(ctx),
-                OpDbg { op, ctx }
-            );
-        }
+        Operation::try_preflight_erase_block(ptr, ctx).expect("Block erase preflight failed");
+        Self::drop_all_uses_preflighted(ptr, ctx);
         if ptr.is_linked(ctx) {
             ptr.unlink(ctx);
         }

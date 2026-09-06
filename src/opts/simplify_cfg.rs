@@ -147,11 +147,20 @@ pub fn remove_blocks_inside_op(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
+    Operation::try_preflight_tree(op, ctx).expect("CFG-removal operation preflight failed");
+    remove_blocks_inside_op_impl(op, ctx, rewriter)
+}
+
+fn remove_blocks_inside_op_impl(
+    op: Ptr<Operation>,
+    ctx: &mut Context,
+    rewriter: &mut dyn Rewriter,
+) -> IRStatus {
     let regions: Vec<Ptr<Region>> = op.deref(ctx).regions().collect();
     let mut status = IRStatus::Unchanged;
     //TODO: RegionBranchOpInterface should allow us to handle this less conservatively
     for region in regions {
-        status |= remove_blocks_inside_region(region, ctx, rewriter);
+        status |= remove_blocks_inside_region_impl(region, ctx, rewriter);
     }
     status
 }
@@ -163,10 +172,19 @@ pub fn remove_blocks_inside_block(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
+    Operation::try_preflight_block_tree(block, ctx).expect("CFG-removal block preflight failed");
+    remove_blocks_inside_block_impl(block, ctx, rewriter)
+}
+
+fn remove_blocks_inside_block_impl(
+    block: Ptr<BasicBlock>,
+    ctx: &mut Context,
+    rewriter: &mut dyn Rewriter,
+) -> IRStatus {
     let ops: Vec<Ptr<Operation>> = block.deref(ctx).iter(ctx).collect();
     let mut status = IRStatus::Unchanged;
     for op in ops {
-        status |= remove_blocks_inside_op(op, ctx, rewriter);
+        status |= remove_blocks_inside_op_impl(op, ctx, rewriter);
     }
     status
 }
@@ -178,12 +196,21 @@ pub fn remove_blocks_inside_region(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
+    Operation::try_preflight_region_tree(region, ctx).expect("CFG-removal region preflight failed");
+    remove_blocks_inside_region_impl(region, ctx, rewriter)
+}
+
+fn remove_blocks_inside_region_impl(
+    region: Ptr<Region>,
+    ctx: &mut Context,
+    rewriter: &mut dyn Rewriter,
+) -> IRStatus {
     if !region.deref(ctx).has_ssa_dominance(ctx) {
         let head = region
             .deref(ctx)
             .get_head()
             .expect("all regions should have entry block");
-        return remove_blocks_inside_block(head, ctx, rewriter);
+        return remove_blocks_inside_block_impl(head, ctx, rewriter);
     }
 
     let Some(entry) = region.deref(ctx).get_head() else {
@@ -198,7 +225,7 @@ pub fn remove_blocks_inside_region(
             continue;
         }
 
-        status |= remove_blocks_inside_block(block, ctx, rewriter);
+        status |= remove_blocks_inside_block_impl(block, ctx, rewriter);
 
         for succ in block.deref(ctx).succs(ctx) {
             stack.push(succ);
@@ -233,11 +260,20 @@ pub fn merge_inside_op(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
+    Operation::try_preflight_tree(op, ctx).expect("CFG-merge operation preflight failed");
+    merge_inside_op_impl(op, ctx, rewriter)
+}
+
+fn merge_inside_op_impl(
+    op: Ptr<Operation>,
+    ctx: &mut Context,
+    rewriter: &mut dyn Rewriter,
+) -> IRStatus {
     let regions: Vec<Ptr<Region>> = op.deref(ctx).regions().collect();
     let mut status = IRStatus::Unchanged;
     //TODO: RegionBranchOpInterface should allow us to handle this less conservatively
     for region in regions {
-        status |= merge_inside_region(region, ctx, rewriter);
+        status |= merge_inside_region_impl(region, ctx, rewriter);
     }
     status
 }
@@ -249,10 +285,19 @@ pub fn merge_inside_block(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
+    Operation::try_preflight_block_tree(block, ctx).expect("CFG-merge block preflight failed");
+    merge_inside_block_impl(block, ctx, rewriter)
+}
+
+fn merge_inside_block_impl(
+    block: Ptr<BasicBlock>,
+    ctx: &mut Context,
+    rewriter: &mut dyn Rewriter,
+) -> IRStatus {
     let ops: Vec<Ptr<Operation>> = block.deref(ctx).iter(ctx).collect();
     let mut status = IRStatus::Unchanged;
     for op in ops {
-        status |= merge_inside_op(op, ctx, rewriter);
+        status |= merge_inside_op_impl(op, ctx, rewriter);
     }
     status
 }
@@ -264,12 +309,21 @@ pub fn merge_inside_region(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
+    Operation::try_preflight_region_tree(region, ctx).expect("CFG-merge region preflight failed");
+    merge_inside_region_impl(region, ctx, rewriter)
+}
+
+fn merge_inside_region_impl(
+    region: Ptr<Region>,
+    ctx: &mut Context,
+    rewriter: &mut dyn Rewriter,
+) -> IRStatus {
     if !region.deref(ctx).has_ssa_dominance(ctx) {
         let head = region
             .deref(ctx)
             .get_head()
             .expect("all regions should have entry block");
-        return merge_inside_block(head, ctx, rewriter);
+        return merge_inside_block_impl(head, ctx, rewriter);
     }
 
     let Some(entry) = region.deref(ctx).get_head() else {
@@ -288,7 +342,7 @@ pub fn merge_inside_region(
             status = IRStatus::Changed;
         }
 
-        status |= merge_inside_block(block, ctx, rewriter);
+        status |= merge_inside_block_impl(block, ctx, rewriter);
 
         for succ in block.deref(ctx).succs(ctx) {
             stack.push(succ);
@@ -300,6 +354,7 @@ pub fn merge_inside_region(
 
 /// Simplifies the CFG, as described in the module-level documentation.
 pub fn simplify_cfg(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
+    Operation::try_preflight_tree(op, ctx)?;
     let mut fold_candidates: Vec<(Ptr<Operation>, Vec<Option<AttrObj>>)> = Vec::new();
     walk_op(
         ctx,
@@ -351,8 +406,8 @@ pub fn simplify_cfg(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
         status |= fold_result;
     }
 
-    status |= remove_blocks_inside_op(op, ctx, &mut rewriter);
-    status |= merge_inside_op(op, ctx, &mut rewriter);
+    status |= remove_blocks_inside_op_impl(op, ctx, &mut rewriter);
+    status |= merge_inside_op_impl(op, ctx, &mut rewriter);
 
     Ok(status)
 }

@@ -117,9 +117,14 @@ impl Region {
 
     /// Drop all uses that this region holds.
     pub fn drop_all_uses(ptr: Ptr<Self>, ctx: &Context) {
+        Operation::try_preflight_region_tree(ptr, ctx).expect("Region use-drop preflight failed");
+        Self::drop_all_uses_preflighted(ptr, ctx);
+    }
+
+    pub(crate) fn drop_all_uses_preflighted(ptr: Ptr<Self>, ctx: &Context) {
         let blocks: Vec<_> = ptr.deref(ctx).iter(ctx).collect();
         for block in blocks {
-            BasicBlock::drop_all_uses(block, ctx);
+            BasicBlock::drop_all_uses_preflighted(block, ctx);
         }
     }
 }

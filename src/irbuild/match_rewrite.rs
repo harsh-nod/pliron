@@ -63,6 +63,7 @@ pub fn apply_match_rewrite<M: MatchRewrite>(
     order: RewriterOrder,
     op: Ptr<Operation>,
 ) -> Result<IRStatus> {
+    Operation::try_preflight_tree(op, ctx)?;
     let mut to_rewrite = VecDeque::new();
 
     // Collect all operations that match.
@@ -190,5 +191,102 @@ impl<M: MatchRewrite> Pass for PassWrapper<M> {
 
     fn name(&self) -> &str {
         self.name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        builtin::{op_interfaces::OneRegionInterface, ops::ModuleOp},
+        context::ForeignContextPtrDerefError,
+        linked_list::ContainsLinkedList,
+        op::Op,
+    };
+
+    #[derive(Eq, PartialEq)]
+    struct ContextSnapshot {
+        operation_count: usize,
+        region_count: usize,
+        block_count: usize,
+        value_counter: u64,
+        use_counter: u64,
+        epoch: u64,
+        region_head: Option<Ptr<crate::basic_block::BasicBlock>>,
+        region_tail: Option<Ptr<crate::basic_block::BasicBlock>>,
+    }
+
+    fn snapshot(ctx: &Context, module: ModuleOp) -> ContextSnapshot {
+        let region = module.get_region(ctx);
+        let region_ref = region.deref(ctx);
+        ContextSnapshot {
+            operation_count: ctx.operations.len(),
+            region_count: ctx.regions.len(),
+            block_count: ctx.basic_blocks.len(),
+            value_counter: ctx.value_counter.get(),
+            use_counter: ctx.use_counter.get(),
+            epoch: ctx.ir_mutation_attempt_epoch().unwrap().value(),
+            region_head: region_ref.get_head(),
+            region_tail: region_ref.get_tail(),
+        }
+    }
+
+    struct MustNotRun {
+        matched: bool,
+        rewritten: bool,
+    }
+
+    impl MatchRewrite for MustNotRun {
+        fn r#match(&mut self, _ctx: &Context, _op: Ptr<Operation>) -> bool {
+            self.matched = true;
+            true
+        }
+
+        fn rewrite(
+            &mut self,
+            _ctx: &mut Context,
+            _rewriter: &mut MatchRewriter,
+            _op: Ptr<Operation>,
+        ) -> Result<()> {
+            self.rewritten = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn foreign_equal_slot_root_is_rejected_before_matcher_or_state_changes() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_module = ModuleOp::new(&mut owner, "owner".try_into().unwrap());
+        let foreign_module = ModuleOp::new(&mut foreign, "foreign".try_into().unwrap());
+        assert_eq!(
+            owner_module.get_operation().idx,
+            foreign_module.get_operation().idx
+        );
+
+        let owner_before = snapshot(&owner, owner_module);
+        let foreign_before = snapshot(&foreign, foreign_module);
+        let mut matcher = MustNotRun {
+            matched: false,
+            rewritten: false,
+        };
+        let error = apply_match_rewrite(
+            &mut owner,
+            &mut matcher,
+            RewriterOrder::default(),
+            foreign_module.get_operation(),
+        )
+        .expect_err("foreign rewrite root must be rejected");
+
+        assert!(
+            error
+                .err
+                .downcast_ref::<ForeignContextPtrDerefError>()
+                .is_some()
+        );
+        assert!(!matcher.matched);
+        assert!(!matcher.rewritten);
+        assert!(snapshot(&owner, owner_module) == owner_before);
+        assert!(snapshot(&foreign, foreign_module) == foreign_before);
     }
 }

@@ -658,11 +658,22 @@ mod mutation_epoch_tests {
             ops::ModuleOp,
             types::{IntegerType, Signedness, UnitType},
         },
+        graph::dominance::DomInfo,
+        irbuild::dialect_conversion::{
+            DialectConversion, DialectConversionRewriter, OperandsInfo, apply_dialect_conversion,
+        },
+        irbuild::{
+            inserter::{BlockInsertionPoint, IRInserter, Inserter, OpInsertionPoint},
+            listener::Recorder,
+            rewriter::{IRRewriter, Rewriter},
+        },
         linked_list::{ContainsLinkedList, LinkedList, append_linked_list},
         op::Op,
         operation::{Operation, verify_operation},
+        opts::{dce::dce, mem2reg::mem2reg, simplify_cfg::simplify_cfg},
+        pass::AnalysisManager,
         region::Region,
-        r#type::TypeHandle,
+        r#type::{TypeHandle, Typed},
         uniqued_any,
         value::{DefiningEntity, Use, Value},
     };
@@ -692,6 +703,9 @@ mod mutation_epoch_tests {
         region_parent: Ptr<Operation>,
         region_head: Option<Ptr<BasicBlock>>,
         region_tail: Option<Ptr<BasicBlock>>,
+        block_next: Option<Ptr<BasicBlock>>,
+        block_previous: Option<Ptr<BasicBlock>>,
+        block_container: Option<Ptr<Region>>,
         block_uses: Vec<Use<Ptr<BasicBlock>>>,
         value_uses: Vec<Use<Value>>,
     }
@@ -750,6 +764,12 @@ mod mutation_epoch_tests {
         let region_tail = region.get_tail();
         drop(region);
 
+        let block = fixture.block.deref(context);
+        let block_next = block.get_next();
+        let block_previous = block.get_prev();
+        let block_container = block.get_container();
+        drop(block);
+
         ArenaGraphSnapshot {
             operation_count: context.operations.len(),
             region_count: context.regions.len(),
@@ -765,6 +785,9 @@ mod mutation_epoch_tests {
             region_parent,
             region_head,
             region_tail,
+            block_next,
+            block_previous,
+            block_container,
             block_uses: fixture.block.uses(context),
             value_uses: fixture.value.uses(context),
         }
@@ -785,6 +808,39 @@ mod mutation_epoch_tests {
             assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
             assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
         }};
+    }
+
+    macro_rules! assert_foreign_result_rejected {
+        ($owner:ident, $owner_fixture:ident, $foreign:ident, $foreign_fixture:ident, $action:expr) => {{
+            let owner_epoch = epoch(&$owner);
+            let foreign_epoch = epoch(&$foreign);
+            let owner_graph = graph_snapshot(&$owner, &$owner_fixture);
+            let foreign_graph = graph_snapshot(&$foreign, &$foreign_fixture);
+            let error = expect_error($action);
+            assert!(is_foreign_context_error(&error));
+            assert_eq!(epoch(&$owner), owner_epoch);
+            assert_eq!(epoch(&$foreign), foreign_epoch);
+            assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
+            assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
+        }};
+    }
+
+    struct MustNotConvert;
+
+    impl DialectConversion for MustNotConvert {
+        fn can_convert_op(&self, _ctx: &Context, _op: Ptr<Operation>) -> bool {
+            panic!("conversion callback ran before root preflight")
+        }
+
+        fn rewrite(
+            &mut self,
+            _ctx: &mut Context,
+            _rewriter: &mut DialectConversionRewriter,
+            _op: Ptr<Operation>,
+            _operands_info: &OperandsInfo,
+        ) -> crate::result::Result<()> {
+            panic!("conversion rewrite ran before root preflight")
+        }
     }
 
     #[test]
@@ -1047,6 +1103,679 @@ mod mutation_epoch_tests {
         assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
             append_linked_list(foreign_fixture.region, owner_fixture.region, &owner);
         });
+    }
+
+    #[test]
+    fn equal_slot_dialect_conversion_rejects_before_driver_or_callback_state() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        let mut conversion = MustNotConvert;
+        assert_foreign_result_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            apply_dialect_conversion(&mut owner, &mut conversion, foreign_fixture.operation)
+        });
+    }
+
+    #[test]
+    fn equal_slot_dce_rejects_before_worklist_or_ir_state() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        assert_foreign_result_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            dce(foreign_fixture.operation, &mut owner)
+        });
+    }
+
+    #[test]
+    fn equal_slot_mem2reg_rejects_before_analysis_or_ir_state() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        let mut analyses = AnalysisManager::default();
+        assert_foreign_result_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            mem2reg(foreign_fixture.operation, &mut owner, &mut analyses)
+        });
+        assert!(
+            analyses
+                .try_get_analysis::<DomInfo>(owner_fixture.operation)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn equal_slot_simplify_cfg_rejects_before_worklist_or_ir_state() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        assert_foreign_result_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            simplify_cfg(foreign_fixture.operation, &mut owner)
+        });
+    }
+
+    #[test]
+    fn equal_slot_foreign_root_containment_is_rejected_without_changes() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        crate::linked_list::private::LinkedList::set_container(
+            &mut *owner_fixture.operation.deref_mut(&owner),
+            Some(foreign_fixture.block),
+        );
+        assert_foreign_result_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::try_preflight_tree(owner_fixture.operation, &owner)
+        });
+    }
+
+    #[test]
+    fn equal_slot_foreign_block_parent_is_rejected_without_changes() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        crate::linked_list::private::LinkedList::set_container(
+            &mut *owner_fixture.block.deref_mut(&owner),
+            Some(foreign_fixture.region),
+        );
+        assert_foreign_result_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::try_preflight_block_tree(owner_fixture.block, &owner)
+        });
+    }
+
+    #[test]
+    fn malformed_later_operand_is_rejected_before_any_use_drop() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let op = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![fixture.value, fixture.value],
+            vec![],
+            0,
+        );
+        op.deref_mut(&ctx).operands[1].use_uid = u64::MAX;
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            op.deref(&ctx)
+                .operands
+                .iter()
+                .map(|operand| (operand.r#use.get_def(), operand.use_uid))
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| Operation::drop_all_uses(op, &ctx)))
+                .is_err()
+        );
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                op.deref(&ctx)
+                    .operands
+                    .iter()
+                    .map(|operand| (operand.r#use.get_def(), operand.use_uid))
+                    .collect::<Vec<_>>(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn malformed_later_successor_is_rejected_before_any_use_drop() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let op = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![fixture.block, fixture.block],
+            0,
+        );
+        op.deref_mut(&ctx).successors[1].use_uid = u64::MAX;
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            op.deref(&ctx)
+                .successors
+                .iter()
+                .map(|successor| (successor.r#use.get_def(), successor.use_uid))
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| Operation::drop_all_uses(op, &ctx)))
+                .is_err()
+        );
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                op.deref(&ctx)
+                    .successors
+                    .iter()
+                    .map(|successor| (successor.r#use.get_def(), successor.use_uid))
+                    .collect::<Vec<_>>(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn operation_erase_rejects_result_use_before_dropping_outgoing_uses() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let definition = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![ty],
+            vec![fixture.value],
+            vec![fixture.block],
+            0,
+        );
+        let result = definition.deref(&ctx).get_result(0);
+        let user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![result],
+            vec![],
+            0,
+        );
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            definition.deref(&ctx).operands().collect::<Vec<_>>(),
+            definition.deref(&ctx).successors().collect::<Vec<_>>(),
+            result.uses(&ctx),
+            user.deref(&ctx).operands().collect::<Vec<_>>(),
+        );
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                Operation::erase(definition, &mut ctx)
+            }))
+            .is_err()
+        );
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                definition.deref(&ctx).operands().collect::<Vec<_>>(),
+                definition.deref(&ctx).successors().collect::<Vec<_>>(),
+                result.uses(&ctx),
+                user.deref(&ctx).operands().collect::<Vec<_>>(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn block_erase_rejects_external_predecessor_before_dropping_uses() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let predecessor = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![fixture.value],
+            vec![fixture.block],
+            0,
+        );
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            predecessor.deref(&ctx).operands().collect::<Vec<_>>(),
+            predecessor.deref(&ctx).successors().collect::<Vec<_>>(),
+        );
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                BasicBlock::erase(fixture.block, &mut ctx)
+            }))
+            .is_err()
+        );
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                predecessor.deref(&ctx).operands().collect::<Vec<_>>(),
+                predecessor.deref(&ctx).successors().collect::<Vec<_>>(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn region_erase_rejects_nested_external_result_use_before_dropping_uses() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let definition = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![ty],
+            vec![fixture.value],
+            vec![],
+            0,
+        );
+        definition.insert_at_back(fixture.block, &ctx);
+        let result = definition.deref(&ctx).get_result(0);
+        let user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![result],
+            vec![],
+            0,
+        );
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            definition.deref(&ctx).operands().collect::<Vec<_>>(),
+            result.uses(&ctx),
+            user.deref(&ctx).operands().collect::<Vec<_>>(),
+        );
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                Operation::erase_region(fixture.operation, &mut ctx, 0)
+            }))
+            .is_err()
+        );
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                definition.deref(&ctx).operands().collect::<Vec<_>>(),
+                result.uses(&ctx),
+                user.deref(&ctx).operands().collect::<Vec<_>>(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn rewriter_replacement_rejects_malformed_later_result_before_events_or_mutation() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let definition = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![ty, ty],
+            vec![fixture.value],
+            vec![fixture.block],
+            0,
+        );
+        let first_result = definition.deref(&ctx).get_result(0);
+        let second_result = definition.deref(&ctx).get_result(1);
+        let first_user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![first_result],
+            vec![],
+            0,
+        );
+        let second_user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![second_result],
+            vec![],
+            0,
+        );
+        second_user.deref_mut(&ctx).operands[0].use_uid = u64::MAX;
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            definition.deref(&ctx).operands().collect::<Vec<_>>(),
+            definition.deref(&ctx).successors().collect::<Vec<_>>(),
+            first_result.uses(&ctx),
+            second_result.uses(&ctx),
+            first_user.deref(&ctx).operands().collect::<Vec<_>>(),
+            second_user.deref(&ctx).operands[0].use_uid,
+        );
+        let mut rewriter = IRRewriter::<Recorder>::default();
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.replace_operation_with_values(
+                    &mut ctx,
+                    definition,
+                    vec![fixture.value, fixture.value],
+                )
+            }))
+            .is_err()
+        );
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                definition.deref(&ctx).operands().collect::<Vec<_>>(),
+                definition.deref(&ctx).successors().collect::<Vec<_>>(),
+                first_result.uses(&ctx),
+                second_result.uses(&ctx),
+                first_user.deref(&ctx).operands().collect::<Vec<_>>(),
+                second_user.deref(&ctx).operands[0].use_uid,
+            ) == before
+        );
+    }
+
+    #[test]
+    fn rewriter_value_replacement_rejects_malformed_use_before_event_or_mutation() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let replacement_block = BasicBlock::new(&mut ctx, None, vec![ty]);
+        let replacement = replacement_block.deref(&ctx).get_argument(0);
+        let first_user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![fixture.value],
+            vec![],
+            0,
+        );
+        let second_user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![fixture.value],
+            vec![],
+            0,
+        );
+        second_user.deref_mut(&ctx).operands[0].use_uid = u64::MAX;
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            replacement.uses(&ctx),
+            first_user.deref(&ctx).operands().collect::<Vec<_>>(),
+            second_user.deref(&ctx).operands[0].use_uid,
+        );
+        let mut rewriter = IRRewriter::<Recorder>::default();
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.replace_value_uses_with(&ctx, fixture.value, replacement)
+            }))
+            .is_err()
+        );
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                replacement.uses(&ctx),
+                first_user.deref(&ctx).operands().collect::<Vec<_>>(),
+                second_user.deref(&ctx).operands[0].use_uid,
+            ) == before
+        );
+    }
+
+    #[test]
+    fn rewriter_rejects_same_or_nested_replacement_definitions_before_events() {
+        let mut ctx = Context::try_new().unwrap();
+        let ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let root = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![ty],
+            vec![],
+            vec![],
+            1,
+        );
+        let region = root.deref(&ctx).get_region(0);
+        let block = BasicBlock::new(&mut ctx, None, vec![]);
+        block.insert_at_front(region, &ctx);
+        let nested = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![ty],
+            vec![],
+            vec![],
+            0,
+        );
+        nested.insert_at_front(block, &ctx);
+        let nested_result = nested.deref(&ctx).get_result(0);
+        let before = (
+            ctx.operations.len(),
+            ctx.regions.len(),
+            ctx.basic_blocks.len(),
+            ctx.value_counter.get(),
+            ctx.use_counter.get(),
+            epoch(&ctx),
+            root.deref(&ctx).regions().collect::<Vec<_>>(),
+            region.deref(&ctx).get_head(),
+            block.deref(&ctx).get_head(),
+            nested_result.uses(&ctx),
+        );
+        let mut rewriter = IRRewriter::<Recorder>::default();
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.replace_operation_with_values(&mut ctx, root, vec![nested_result])
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.replace_operation(&mut ctx, root, root)
+            }))
+            .is_err()
+        );
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert!(
+            (
+                ctx.operations.len(),
+                ctx.regions.len(),
+                ctx.basic_blocks.len(),
+                ctx.value_counter.get(),
+                ctx.use_counter.get(),
+                epoch(&ctx),
+                root.deref(&ctx).regions().collect::<Vec<_>>(),
+                region.deref(&ctx).get_head(),
+                block.deref(&ctx).get_head(),
+                nested_result.uses(&ctx),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn inserter_rejects_foreign_operation_and_block_destinations_before_events() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        let operation = Operation::new(
+            &mut owner,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            0,
+        );
+        let block = BasicBlock::new(&mut owner, None, vec![]);
+        let owner_before = graph_snapshot(&owner, &owner_fixture);
+        let foreign_before = graph_snapshot(&foreign, &foreign_fixture);
+
+        let mut op_inserter =
+            IRInserter::<Recorder>::new(OpInsertionPoint::AtBlockEnd(foreign_fixture.block));
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                op_inserter.insert_operation(&owner, operation)
+            }))
+            .is_err()
+        );
+        assert!(op_inserter.get_listener().events.is_empty());
+        assert!(!op_inserter.is_modified());
+
+        let mut block_inserter = IRInserter::<Recorder>::default();
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                block_inserter.insert_block(
+                    &owner,
+                    BlockInsertionPoint::AtRegionEnd(foreign_fixture.region),
+                    block,
+                )
+            }))
+            .is_err()
+        );
+        assert!(block_inserter.get_listener().events.is_empty());
+        assert!(!block_inserter.is_modified());
+        assert!(graph_snapshot(&owner, &owner_fixture) == owner_before);
+        assert!(graph_snapshot(&foreign, &foreign_fixture) == foreign_before);
+        assert!(!operation.is_linked(&owner));
+        assert!(!block.is_linked(&owner));
+    }
+
+    #[test]
+    fn rewriter_rejects_moves_and_inline_into_own_subtree_before_events() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let root = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        root.insert_at_back(fixture.block, &ctx);
+        let root_region = root.deref(&ctx).get_region(0);
+        let root_block = BasicBlock::new(&mut ctx, None, vec![]);
+        root_block.insert_at_front(root_region, &ctx);
+        let nested = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![],
+            vec![],
+            1,
+        );
+        nested.insert_at_front(root_block, &ctx);
+        let nested_region = nested.deref(&ctx).get_region(0);
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            root.deref(&ctx).get_parent_block(),
+            root_region.deref(&ctx).get_head(),
+            root_block.deref(&ctx).get_head(),
+            nested_region.deref(&ctx).get_head(),
+        );
+        let mut rewriter = IRRewriter::<Recorder>::default();
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.move_operation(&ctx, root, OpInsertionPoint::BeforeOperation(root))
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.move_block(
+                    &ctx,
+                    root_block,
+                    BlockInsertionPoint::BeforeBlock(root_block),
+                )
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.move_operation(&ctx, root, OpInsertionPoint::AtBlockEnd(root_block))
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.move_block(
+                    &ctx,
+                    root_block,
+                    BlockInsertionPoint::AtRegionEnd(nested_region),
+                )
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.inline_region(
+                    &ctx,
+                    root_region,
+                    BlockInsertionPoint::AtRegionEnd(nested_region),
+                )
+            }))
+            .is_err()
+        );
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                root.deref(&ctx).get_parent_block(),
+                root_region.deref(&ctx).get_head(),
+                root_block.deref(&ctx).get_head(),
+                nested_region.deref(&ctx).get_head(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn split_rejects_position_in_another_block_before_allocation_or_events() {
+        let mut ctx = Context::try_new().unwrap();
+        let fixture = arena_fixture(&mut ctx, "owner");
+        let other = BasicBlock::new(&mut ctx, None, vec![]);
+        other.insert_at_back(fixture.region, &ctx);
+        let before = (
+            graph_snapshot(&ctx, &fixture),
+            other.deref(&ctx).get_container(),
+            other.deref(&ctx).get_prev(),
+            other.deref(&ctx).get_next(),
+        );
+        let mut rewriter = IRRewriter::<Recorder>::default();
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.split_block(
+                    &mut ctx,
+                    fixture.block,
+                    OpInsertionPoint::AtBlockStart(other),
+                    None,
+                )
+            }))
+            .is_err()
+        );
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert!(
+            (
+                graph_snapshot(&ctx, &fixture),
+                other.deref(&ctx).get_container(),
+                other.deref(&ctx).get_prev(),
+                other.deref(&ctx).get_next(),
+            ) == before
+        );
+    }
+
+    #[test]
+    fn type_change_authenticates_new_type_before_listener_or_value_mutation() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+        let mut foreign_type: TypeHandle = UnitType::get(&foreign).into();
+        for width in 1..128 {
+            foreign_type = IntegerType::get(&foreign, width, Signedness::Unsigned).into();
+        }
+        let owner_before = graph_snapshot(&owner, &owner_fixture);
+        let foreign_before = graph_snapshot(&foreign, &foreign_fixture);
+        let old_type = owner_fixture.value.get_type(&owner);
+        let mut rewriter = IRRewriter::<Recorder>::default();
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                rewriter.set_value_type(&owner, owner_fixture.value, foreign_type)
+            }))
+            .is_err()
+        );
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert!(graph_snapshot(&owner, &owner_fixture) == owner_before);
+        assert!(graph_snapshot(&foreign, &foreign_fixture) == foreign_before);
+        assert!(owner_fixture.value.get_type(&owner) == old_type);
     }
 
     #[test]

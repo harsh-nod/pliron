@@ -3,7 +3,10 @@
 
 //! Provide linked-list operations for `Ptr<T: LinkedList>`.
 
-use crate::context::{Context, Ptr, private::ArenaObj};
+use crate::{
+    context::{Context, Ptr, private::ArenaObj},
+    result::Result,
+};
 
 /// The setter methods on [LinkedList] and [ContainsLinkedList]
 /// are not safe for using from anywhere except the impls here.
@@ -117,12 +120,15 @@ pub trait LinkedList: private::LinkedList {
 }
 
 /// Authenticate and structurally validate a complete list without mutating it.
-fn preflight_linked_list<C: ContainsLinkedList<U> + ArenaObj, U: LinkedList<ContainerType = C>>(
+pub(crate) fn try_preflight_linked_list<
+    C: ContainsLinkedList<U> + ArenaObj,
+    U: LinkedList<ContainerType = C>,
+>(
     container: Ptr<C>,
     ctx: &Context,
-) {
+) -> Result<()> {
     let (head, tail) = {
-        let container = container.deref(ctx);
+        let container = container.try_deref(ctx)?;
         (container.get_head(), container.get_tail())
     };
     assert_eq!(head.is_none(), tail.is_none());
@@ -136,17 +142,17 @@ fn preflight_linked_list<C: ContainsLinkedList<U> + ArenaObj, U: LinkedList<Cont
         visited += 1;
 
         let (node_previous, next, node_container) = {
-            let node = node.deref(ctx);
+            let node = node.try_deref(ctx)?;
             (node.get_prev(), node.get_next(), node.get_container())
         };
         if let Some(node_previous) = node_previous {
-            drop(node_previous.deref(ctx));
+            drop(node_previous.try_deref(ctx)?);
         }
         if let Some(next) = next {
-            drop(next.deref(ctx));
+            drop(next.try_deref(ctx)?);
         }
         let node_container = node_container.expect("LinkedList node is missing its container");
-        drop(node_container.deref(ctx));
+        drop(node_container.try_deref(ctx)?);
         assert!(node_container == container);
         assert!(node_previous == previous);
         if next.is_none() {
@@ -156,6 +162,14 @@ fn preflight_linked_list<C: ContainsLinkedList<U> + ArenaObj, U: LinkedList<Cont
         current = next;
     }
     assert!(previous == tail);
+    Ok(())
+}
+
+fn preflight_linked_list<C: ContainsLinkedList<U> + ArenaObj, U: LinkedList<ContainerType = C>>(
+    container: Ptr<C>,
+    ctx: &Context,
+) {
+    try_preflight_linked_list(container, ctx).expect("LinkedList preflight failed");
 }
 
 /// Append all nodes from `donor` to the back of `donee`, leaving `donor` empty.

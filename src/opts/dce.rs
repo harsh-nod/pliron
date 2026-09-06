@@ -190,6 +190,7 @@ fn note_erased_ops(
 /// Perform dead code elimination on the given operation and its nested operations.
 /// See module-level documentation for details on the DCE criteria and interfaces.
 pub fn dce(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
+    Operation::try_preflight_tree(op, ctx)?;
     let mut rewriter = IRRewriter::<Recorder>::default();
 
     let mut cemetery: Vec<DCECandidate> = Vec::new();

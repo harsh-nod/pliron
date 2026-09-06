@@ -22,7 +22,7 @@ use crate::{
         inserter::{IRInserter, Inserter, OpInsertionPoint},
         listener::DummyListener,
     },
-    linked_list::ContainsLinkedList,
+    linked_list::{ContainsLinkedList, try_preflight_linked_list},
     location::Located,
     op::op_cast,
     operation::Operation,
@@ -57,9 +57,68 @@ pub enum SymbolTableErr {
     SymbolOpNotInTableOp,
 }
 
+fn try_block_parent_op(
+    block: Ptr<crate::basic_block::BasicBlock>,
+    ctx: &Context,
+) -> Result<Option<Ptr<Operation>>> {
+    drop(block.try_deref(ctx)?);
+    try_preflight_linked_list(block, ctx)?;
+    let Some(region) = block.try_deref(ctx)?.get_parent_region() else {
+        return Ok(None);
+    };
+
+    try_preflight_linked_list(region, ctx)?;
+    assert!(
+        region
+            .try_deref(ctx)?
+            .iter(ctx)
+            .any(|candidate| candidate == block)
+    );
+    let parent_op = region.try_deref(ctx)?.get_parent_op();
+    let parent_op_ref = parent_op.try_deref(ctx)?;
+    assert!(parent_op_ref.regions().any(|candidate| candidate == region));
+    Ok(Some(parent_op))
+}
+
+fn try_operation_parent_op(op: Ptr<Operation>, ctx: &Context) -> Result<Option<Ptr<Operation>>> {
+    let Some(block) = op.try_deref(ctx)?.get_parent_block() else {
+        return Ok(None);
+    };
+
+    try_preflight_linked_list(block, ctx)?;
+    assert!(
+        block
+            .try_deref(ctx)?
+            .iter(ctx)
+            .any(|candidate| candidate == op)
+    );
+    try_block_parent_op(block, ctx)
+}
+
+fn try_insertion_block(
+    insert_pt: OpInsertionPoint,
+    ctx: &Context,
+) -> Result<Option<Ptr<crate::basic_block::BasicBlock>>> {
+    let block = match insert_pt {
+        OpInsertionPoint::AtBlockStart(block) | OpInsertionPoint::AtBlockEnd(block) => Some(block),
+        OpInsertionPoint::AfterOperation(op) | OpInsertionPoint::BeforeOperation(op) => {
+            try_operation_parent_op(op, ctx)?;
+            op.try_deref(ctx)?.get_parent_block()
+        }
+        OpInsertionPoint::Unset => None,
+    };
+    if let Some(block) = block {
+        try_block_parent_op(block, ctx)?;
+    }
+    Ok(block)
+}
+
 impl SymbolTable {
     /// Create a new [SymbolTable] from a [SymbolTableInterface] Op.
     pub fn new(ctx: &Context, symbol_table_op: Box<dyn SymbolTableInterface>) -> Self {
+        Operation::try_preflight_tree(symbol_table_op.get_operation(), ctx)
+            .expect("Symbol table operation preflight failed");
+
         // Go through the all operations in symbol_table_op and build a table.
         let mut symbol_table = HMap::<Identifier, Box<dyn SymbolOpInterface>>::default();
         let table_ops_block = symbol_table_op.get_body(ctx, 0);
@@ -99,11 +158,22 @@ impl SymbolTable {
         symbol_op: Box<dyn SymbolOpInterface>,
         insert_pt: Option<OpInsertionPoint>,
     ) -> Result<()> {
+        let symbol_table_op = self.symbol_table_op.get_operation();
+        let symbol_op_ptr = symbol_op.get_operation();
+
+        // Complete every pointer and structural check before symbol-name cloning,
+        // map growth, listener notification, or IR mutation.
+        Operation::try_preflight_tree(symbol_table_op, ctx)?;
+        Operation::try_preflight_tree(symbol_op_ptr, ctx)?;
+        try_operation_parent_op(symbol_table_op, ctx)?;
+        let symbol_op_parent = try_operation_parent_op(symbol_op_ptr, ctx)?;
+        let insertion_block = match insert_pt {
+            Some(insert_pt) => try_insertion_block(insert_pt, ctx)?,
+            None => None,
+        };
+
         let symbol_name = symbol_op.get_symbol_name(ctx);
-        if let Some(prev_op) = self
-            .symbol_table
-            .insert(symbol_name.clone(), symbol_op.clone())
-        {
+        if let Some(prev_op) = self.symbol_table.get(&symbol_name) {
             return arg_err!(
                 symbol_op.loc(ctx),
                 arg_error!(
@@ -113,31 +183,27 @@ impl SymbolTable {
             );
         }
 
-        let symbol_table_op = self.symbol_table_op.get_operation();
-        let symbol_op = symbol_op.get_operation();
-
-        if let Some(symbol_op_parent) = symbol_op.deref(ctx).get_parent_op(ctx) {
+        if let Some(symbol_op_parent) = symbol_op_parent {
             if symbol_table_op != symbol_op_parent {
                 return arg_err!(
-                    symbol_op.deref(ctx).loc(),
+                    symbol_op_ptr.deref(ctx).loc(),
                     SymbolTableErr::SymbolOpAlreadyInAnotherTable(symbol_name.to_string())
                 );
             }
             // Nothing more to do.
         } else if let Some(insert_pt) = insert_pt {
-            let insert_pt_parent = insert_pt
-                .get_insertion_block(ctx)
-                .expect("Invalid insertion point")
-                .deref(ctx)
-                .get_parent_op(ctx);
+            let insert_pt_parent = match insertion_block {
+                Some(block) => try_block_parent_op(block, ctx)?,
+                None => None,
+            };
             match insert_pt_parent {
                 Some(parent) if parent == symbol_table_op => {
                     let mut inserter = IRInserter::<DummyListener>::new(insert_pt);
-                    inserter.insert_operation(ctx, symbol_op);
+                    inserter.insert_operation(ctx, symbol_op_ptr);
                 }
                 _ => {
                     return arg_err!(
-                        symbol_op.deref(ctx).loc(),
+                        symbol_op_ptr.deref(ctx).loc(),
                         SymbolTableErr::InsertionPointNotInSameTable
                     );
                 }
@@ -147,11 +213,13 @@ impl SymbolTable {
             let block = self.symbol_table_op.get_body(ctx, 0);
             let terminator = block.deref(ctx).get_terminator(ctx);
             match terminator {
-                Some(terminator) => symbol_op.insert_before(ctx, terminator),
-                None => symbol_op.insert_at_back(block, ctx),
+                Some(terminator) => symbol_op_ptr.insert_before(ctx, terminator),
+                None => symbol_op_ptr.insert_at_back(block, ctx),
             }
         }
 
+        let previous = self.symbol_table.insert(symbol_name, symbol_op);
+        assert!(previous.is_none(), "Symbol table changed during insertion");
         Ok(())
     }
 
@@ -159,12 +227,22 @@ impl SymbolTable {
     /// The operation is unlinked from its parent, but is not erased.
     pub fn remove(&mut self, ctx: &Context, symbol_op: Box<dyn SymbolOpInterface>) -> Result<()> {
         let symbol_op_opr = symbol_op.get_operation();
-        if !matches!(symbol_op_opr.deref(ctx).get_parent_op(ctx), Some(parent_op) if parent_op == self.symbol_table_op.get_operation())
-        {
+        let symbol_table_op = self.symbol_table_op.get_operation();
+        Operation::try_preflight_tree(symbol_table_op, ctx)?;
+        Operation::try_preflight_tree(symbol_op_opr, ctx)?;
+        try_operation_parent_op(symbol_table_op, ctx)?;
+        let symbol_parent = try_operation_parent_op(symbol_op_opr, ctx)?;
+        if symbol_parent != Some(symbol_table_op) {
             return arg_err!(symbol_op.loc(ctx), SymbolTableErr::SymbolOpNotInTableOp);
         }
 
         let symbol = symbol_op.get_symbol_name(ctx);
+        if !matches!(
+            self.symbol_table.get(&symbol),
+            Some(registered) if registered.get_operation() == symbol_op_opr
+        ) {
+            return arg_err!(symbol_op.loc(ctx), SymbolTableErr::SymbolOpNotInTableOp);
+        }
         self.symbol_table.remove(&symbol);
 
         symbol_op_opr.unlink(ctx);
@@ -179,6 +257,7 @@ impl SymbolTable {
         ctx: &mut Context,
         symbol_op: Box<dyn SymbolOpInterface>,
     ) -> Result<()> {
+        Operation::try_preflight_erase_tree(symbol_op.get_operation(), ctx)?;
         self.remove(ctx, symbol_op.clone())?;
         Operation::erase(symbol_op.get_operation(), ctx);
         Ok(())
@@ -279,6 +358,8 @@ impl SymbolTableCollection {
         ctx: &Context,
         symbol_table_op: Box<dyn SymbolTableInterface>,
     ) -> &mut SymbolTable {
+        Operation::try_preflight_tree(symbol_table_op.get_operation(), ctx)
+            .expect("Symbol table operation preflight failed");
         self.symbol_tables
             .entry(symbol_table_op.get_operation())
             .or_insert_with(|| SymbolTable::new(ctx, symbol_table_op))
@@ -302,14 +383,17 @@ mod tests {
     use super::*;
     use crate::{
         builtin::{
+            op_interfaces::SingleBlockRegionInterface,
             ops::{FuncOp, ModuleOp},
             types::FunctionType,
         },
-        context::Context,
+        context::{Context, ForeignContextPtrDerefError},
         identifier::Identifier,
+        linked_list::LinkedList,
         op::Op,
     };
     use alloc::vec;
+    use core::panic::AssertUnwindSafe;
 
     #[test]
     fn test_symbol_table() -> Result<()> {
@@ -344,6 +428,235 @@ mod tests {
         assert!(f1.get_operation().deref(ctx).get_parent_op(ctx).is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn foreign_equal_slot_insertion_point_leaves_symbol_table_and_ir_unchanged() {
+        #[derive(Eq, PartialEq)]
+        struct Snapshot {
+            operation_count: usize,
+            region_count: usize,
+            block_count: usize,
+            value_counter: u64,
+            use_counter: u64,
+            epoch: u64,
+            module_body_head: Option<Ptr<Operation>>,
+            module_body_tail: Option<Ptr<Operation>>,
+            function_parent: Option<Ptr<crate::basic_block::BasicBlock>>,
+            function_prev: Option<Ptr<Operation>>,
+            function_next: Option<Ptr<Operation>>,
+        }
+
+        fn snapshot(ctx: &Context, module: ModuleOp, function: FuncOp) -> Snapshot {
+            let body = module.get_body(ctx, 0);
+            let body_ref = body.deref(ctx);
+            let module_body_head = body_ref.get_head();
+            let module_body_tail = body_ref.get_tail();
+            drop(body_ref);
+            let function_ref = function.get_operation().deref(ctx);
+            Snapshot {
+                operation_count: ctx.operations.len(),
+                region_count: ctx.regions.len(),
+                block_count: ctx.basic_blocks.len(),
+                value_counter: ctx.value_counter.get(),
+                use_counter: ctx.use_counter.get(),
+                epoch: ctx.ir_mutation_attempt_epoch().unwrap().value(),
+                module_body_head,
+                module_body_tail,
+                function_parent: function_ref.get_parent_block(),
+                function_prev: function_ref.get_prev(),
+                function_next: function_ref.get_next(),
+            }
+        }
+
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_module = ModuleOp::new(&mut owner, "owner".try_into().unwrap());
+        let foreign_module = ModuleOp::new(&mut foreign, "foreign".try_into().unwrap());
+        let owner_type = FunctionType::get(&owner, vec![], vec![]);
+        let foreign_type = FunctionType::get(&foreign, vec![], vec![]);
+        let owner_function = FuncOp::new(&mut owner, "candidate".try_into().unwrap(), owner_type);
+        let foreign_function =
+            FuncOp::new(&mut foreign, "foreign_fn".try_into().unwrap(), foreign_type);
+        assert_eq!(
+            owner_function.get_operation().idx,
+            foreign_function.get_operation().idx
+        );
+
+        let mut symbol_table = SymbolTable::new(&owner, Box::new(owner_module));
+        let owner_before = snapshot(&owner, owner_module, owner_function);
+        let foreign_before = snapshot(&foreign, foreign_module, foreign_function);
+        let table_len = symbol_table.symbol_table.len();
+        let table_capacity = symbol_table.symbol_table.capacity();
+
+        let error = symbol_table
+            .insert(
+                &owner,
+                Box::new(owner_function),
+                Some(OpInsertionPoint::BeforeOperation(
+                    foreign_function.get_operation(),
+                )),
+            )
+            .expect_err("foreign insertion point must be rejected");
+        assert!(
+            error
+                .err
+                .downcast_ref::<ForeignContextPtrDerefError>()
+                .is_some()
+        );
+
+        assert!(snapshot(&owner, owner_module, owner_function) == owner_before);
+        assert!(snapshot(&foreign, foreign_module, foreign_function) == foreign_before);
+        assert_eq!(symbol_table.symbol_table.len(), table_len);
+        assert_eq!(symbol_table.symbol_table.capacity(), table_capacity);
+        assert!(
+            symbol_table
+                .lookup(&"candidate".try_into().unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn erase_with_external_ssa_use_leaves_symbol_table_and_ir_unchanged() {
+        let mut ctx = Context::new();
+        let module = ModuleOp::new(&mut ctx, "module".try_into().unwrap());
+        let mut symbol_table = SymbolTable::new(&ctx, Box::new(module));
+        let function_type = FunctionType::get(&ctx, vec![], vec![]);
+        let function = FuncOp::new(&mut ctx, "used".try_into().unwrap(), function_type);
+        symbol_table.insert(&ctx, Box::new(function), None).unwrap();
+        Operation::push_result(function.get_operation(), &ctx, function_type.into());
+        let result = function.get_operation().deref(&ctx).get_result(0);
+        let user = Operation::new(
+            &mut ctx,
+            ModuleOp::get_concrete_op_info(),
+            vec![],
+            vec![result],
+            vec![],
+            0,
+        );
+
+        let function_ref = function.get_operation().deref(&ctx);
+        let before = (
+            ctx.operations.len(),
+            ctx.regions.len(),
+            ctx.basic_blocks.len(),
+            ctx.value_counter.get(),
+            ctx.use_counter.get(),
+            ctx.ir_mutation_attempt_epoch().unwrap().value(),
+            function_ref.get_parent_block(),
+            function_ref.get_prev(),
+            function_ref.get_next(),
+            result.uses(&ctx),
+            symbol_table.symbol_table.len(),
+            symbol_table.symbol_table.capacity(),
+        );
+        drop(function_ref);
+
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _ = symbol_table.erase(&mut ctx, Box::new(function));
+            }))
+            .is_err()
+        );
+        let function_ref = function.get_operation().deref(&ctx);
+        assert!(
+            (
+                ctx.operations.len(),
+                ctx.regions.len(),
+                ctx.basic_blocks.len(),
+                ctx.value_counter.get(),
+                ctx.use_counter.get(),
+                ctx.ir_mutation_attempt_epoch().unwrap().value(),
+                function_ref.get_parent_block(),
+                function_ref.get_prev(),
+                function_ref.get_next(),
+                result.uses(&ctx),
+                symbol_table.symbol_table.len(),
+                symbol_table.symbol_table.capacity(),
+            ) == before
+        );
+        assert!(
+            symbol_table
+                .lookup(&"used".try_into().unwrap())
+                .is_some_and(|registered| registered.get_operation() == function.get_operation())
+        );
+        assert!(user.deref(&ctx).get_operand(0) == result);
+    }
+
+    #[test]
+    fn remove_rejects_unregistered_same_name_operation_without_changes() {
+        let mut ctx = Context::new();
+        let module = ModuleOp::new(&mut ctx, "module".try_into().unwrap());
+        let mut symbol_table = SymbolTable::new(&ctx, Box::new(module));
+        let function_type = FunctionType::get(&ctx, vec![], vec![]);
+        let registered = FuncOp::new(&mut ctx, "duplicate".try_into().unwrap(), function_type);
+        symbol_table
+            .insert(&ctx, Box::new(registered), None)
+            .unwrap();
+        let unregistered = FuncOp::new(&mut ctx, "duplicate".try_into().unwrap(), function_type);
+        unregistered
+            .get_operation()
+            .insert_at_back(module.get_body(&ctx, 0), &ctx);
+
+        let registered_ref = registered.get_operation().deref(&ctx);
+        let unregistered_ref = unregistered.get_operation().deref(&ctx);
+        let before = (
+            (
+                ctx.operations.len(),
+                ctx.regions.len(),
+                ctx.basic_blocks.len(),
+                ctx.value_counter.get(),
+                ctx.use_counter.get(),
+                ctx.ir_mutation_attempt_epoch().unwrap().value(),
+            ),
+            (
+                registered_ref.get_parent_block(),
+                registered_ref.get_prev(),
+                registered_ref.get_next(),
+                unregistered_ref.get_parent_block(),
+                unregistered_ref.get_prev(),
+                unregistered_ref.get_next(),
+            ),
+            (
+                symbol_table.symbol_table.len(),
+                symbol_table.symbol_table.capacity(),
+            ),
+        );
+        drop(registered_ref);
+        drop(unregistered_ref);
+
+        assert!(symbol_table.remove(&ctx, Box::new(unregistered)).is_err());
+        let registered_ref = registered.get_operation().deref(&ctx);
+        let unregistered_ref = unregistered.get_operation().deref(&ctx);
+        assert!(
+            (
+                (
+                    ctx.operations.len(),
+                    ctx.regions.len(),
+                    ctx.basic_blocks.len(),
+                    ctx.value_counter.get(),
+                    ctx.use_counter.get(),
+                    ctx.ir_mutation_attempt_epoch().unwrap().value(),
+                ),
+                (
+                    registered_ref.get_parent_block(),
+                    registered_ref.get_prev(),
+                    registered_ref.get_next(),
+                    unregistered_ref.get_parent_block(),
+                    unregistered_ref.get_prev(),
+                    unregistered_ref.get_next(),
+                ),
+                (
+                    symbol_table.symbol_table.len(),
+                    symbol_table.symbol_table.capacity(),
+                ),
+            ) == before
+        );
+        assert!(
+            symbol_table
+                .lookup(&"duplicate".try_into().unwrap())
+                .is_some_and(|entry| entry.get_operation() == registered.get_operation())
+        );
     }
 
     #[test]
