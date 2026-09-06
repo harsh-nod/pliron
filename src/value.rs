@@ -191,14 +191,14 @@ impl Value {
     pub fn try_find_index(&self, ctx: &Context) -> Result<usize> {
         match self.defining_entity {
             DefiningEntity::Op(op) => {
-                let op = op.deref(ctx);
+                let op = op.try_deref(ctx)?;
                 op.results
                     .iter()
                     .position(|res| res.val_uid == self.val_uid)
                     .ok_or_else(|| arg_error!(op.loc(), ValueError::NotInOpResult))
             }
             DefiningEntity::Block(block) => {
-                let block = block.deref(ctx);
+                let block = block.try_deref(ctx)?;
                 block
                     .args
                     .iter()

@@ -9,6 +9,7 @@ use core::{
     fmt::Display,
     hash::Hash,
     marker::PhantomData,
+    num::NonZeroU64,
 };
 
 use crate::{
@@ -21,7 +22,7 @@ use crate::{
     printable::{self, Printable},
     region::Region,
     result::Result,
-    std_deps::sync::LazyLock,
+    std_deps::sync::{LazyLock, Mutex},
     storage_uniquer::UniqueStore,
     r#type::TypeObj,
     uniqued_any::UniquedAny,
@@ -65,11 +66,45 @@ impl IrMutationAttemptEpoch {
 #[error("IR mutation-attempt epoch exhausted")]
 pub struct IrMutationAttemptEpochExhausted;
 
+/// The process-local [Context] identity sequence was exhausted.
+///
+/// Context identities are never reused. Once all non-zero `u64` identities
+/// have been issued, constructing another context fails permanently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("context identity space exhausted")]
+pub struct ContextIdentityExhausted;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ContextIdentity(NonZeroU64);
+
+static NEXT_CONTEXT_IDENTITY: LazyLock<Mutex<Option<NonZeroU64>>> =
+    LazyLock::new(|| Mutex::new(NonZeroU64::new(1)));
+
+fn take_context_identity(
+    next: &mut Option<NonZeroU64>,
+) -> core::result::Result<ContextIdentity, ContextIdentityExhausted> {
+    let identity = next.take().ok_or(ContextIdentityExhausted)?;
+    *next = identity.get().checked_add(1).and_then(NonZeroU64::new);
+    Ok(ContextIdentity(identity))
+}
+
+fn allocate_context_identity() -> core::result::Result<ContextIdentity, ContextIdentityExhausted> {
+    #[cfg(feature = "std")]
+    let mut next = NEXT_CONTEXT_IDENTITY
+        .lock()
+        .map_err(|_| ContextIdentityExhausted)?;
+    #[cfg(not(feature = "std"))]
+    let mut next = NEXT_CONTEXT_IDENTITY.lock();
+    take_context_identity(&mut next)
+}
+
 /// An arena allocation pool for IR objects.
 pub type Arena<T> = SlotMap<ArenaIndex, RefCell<T>>;
 
 /// A context stores all IR data of this compilation session.
 pub struct Context {
+    /// Unforgeable process-local identity carried by every arena pointer.
+    identity: ContextIdentity,
     /// Monotonic counter incremented before every mutation route that can be
     /// reached through a shared [Context] reference, and before arena
     /// allocation/deallocation through an exclusive reference.
@@ -103,6 +138,13 @@ pub struct Context {
 impl Context {
     pub fn new() -> Context {
         Self::default()
+    }
+
+    /// Construct a context, returning a typed error if its process-local
+    /// identity cannot be allocated without reuse.
+    pub fn try_new() -> core::result::Result<Context, ContextIdentityExhausted> {
+        let identity = allocate_context_identity()?;
+        Ok(Self::with_identity(identity))
     }
 
     /// Observe the current IR mutation-attempt epoch.
@@ -158,7 +200,14 @@ impl Context {
 
 impl Default for Context {
     fn default() -> Self {
+        Self::try_new().expect("context identity space exhausted")
+    }
+}
+
+impl Context {
+    fn with_identity(identity: ContextIdentity) -> Self {
         let mut ctx = Context {
+            identity,
             ir_mutation_attempt_epoch: Cell::new(0),
             ir_mutation_attempt_epoch_exhausted: Cell::new(false),
             value_counter: Cell::new(0),
@@ -208,14 +257,17 @@ pub(crate) mod private {
         /// Allocates object on the arena, given a creator function.
         fn alloc<T: FnOnce(Ptr<Self>) -> Self>(ctx: &mut Context, f: T) -> Ptr<Self> {
             ctx.note_ir_mutation_attempt();
-            let creator = |idx: ArenaIndex| {
+            let owner = ctx.identity;
+            let creator = move |idx: ArenaIndex| {
                 let t = f(Ptr::<Self> {
+                    owner,
                     idx,
                     _dummy: PhantomData::<Self>,
                 });
                 RefCell::new(t)
             };
             Ptr::<Self> {
+                owner,
                 idx: Self::get_arena_mut(ctx).insert_with_key(creator),
                 _dummy: PhantomData,
             }
@@ -223,6 +275,7 @@ pub(crate) mod private {
 
         /// Deallocates this object from the arena.
         fn dealloc(ptr: Ptr<Self>, ctx: &mut Context) {
+            ptr.assert_owner(ctx);
             ctx.note_ir_mutation_attempt();
             Self::dealloc_sub_objects(ptr, ctx);
             Self::get_arena_mut(ctx).remove(ptr.idx);
@@ -234,6 +287,7 @@ use private::ArenaObj;
 
 /// Pointer to an IR Object owned by Context.
 pub struct Ptr<T: ArenaObj> {
+    owner: ContextIdentity,
     pub(crate) idx: ArenaIndex,
     pub(crate) _dummy: PhantomData<T>,
 }
@@ -244,11 +298,36 @@ impl<T: ArenaObj> core::fmt::Debug for Ptr<T> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("Attempt to dereference a dangling Ptr")]
 pub struct DanglingPtrDerefError;
 
+/// A [Ptr] was paired with a [Context] that does not own it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("attempt to dereference a Ptr with a non-owning Context")]
+pub struct ForeignContextPtrDerefError;
+
 impl<'a, T: ArenaObj> Ptr<T> {
+    fn is_owned_by(&self, ctx: &Context) -> bool {
+        self.owner == ctx.identity
+    }
+
+    #[track_caller]
+    fn assert_owner(&self, ctx: &Context) {
+        assert!(
+            self.is_owned_by(ctx),
+            "Attempt to use a Ptr with a non-owning Context"
+        );
+    }
+
+    fn require_owner(&self, ctx: &Context) -> Result<()> {
+        if self.is_owned_by(ctx) {
+            Ok(())
+        } else {
+            Err(arg_error_noloc!(ForeignContextPtrDerefError))
+        }
+    }
+
     /// Borrow the inner [RefCell] and return a [Ref] to the pointee.
     /// The borrow is live as long as the returned [Ref] lives.
     /// Panics on dangling [Ptr] or borrow interior mutability errors.
@@ -256,6 +335,7 @@ impl<'a, T: ArenaObj> Ptr<T> {
     /// to enable printing the interior mutability violation locations.
     #[track_caller]
     pub fn deref(&self, ctx: &'a Context) -> Ref<'a, T> {
+        self.assert_owner(ctx);
         T::get_arena(ctx)
             .get(self.idx)
             .expect("Dangling Ptr deref")
@@ -269,6 +349,7 @@ impl<'a, T: ArenaObj> Ptr<T> {
     /// to enable printing the interior mutability violation locations.
     #[track_caller]
     pub fn deref_mut(&self, ctx: &'a Context) -> RefMut<'a, T> {
+        self.assert_owner(ctx);
         ctx.note_ir_mutation_attempt();
         T::get_arena(ctx)
             .get(self.idx)
@@ -281,6 +362,7 @@ impl<'a, T: ArenaObj> Ptr<T> {
     /// If [Ptr] is dangling or already mutably borrowed, an [Error](crate::result::Error)
     /// with [DanglingPtrDerefError] or [BorrowError](core::cell::BorrowError) is returned.
     pub fn try_deref(&self, ctx: &'a Context) -> Result<Ref<'a, T>> {
+        self.require_owner(ctx)?;
         T::get_arena(ctx)
             .get(self.idx)
             .ok_or_else(|| arg_error_noloc!(DanglingPtrDerefError))?
@@ -293,6 +375,7 @@ impl<'a, T: ArenaObj> Ptr<T> {
     /// If [Ptr] is dangling or already borrowed, an [Error](crate::result::Error)
     /// with [DanglingPtrDerefError] or [BorrowMutError](core::cell::BorrowMutError) is returned.
     pub fn try_deref_mut(&self, ctx: &'a Context) -> Result<RefMut<'a, T>> {
+        self.require_owner(ctx)?;
         ctx.note_ir_mutation_attempt();
         T::get_arena(ctx)
             .get(self.idx)
@@ -318,7 +401,7 @@ impl<T: ArenaObj> Copy for Ptr<T> {}
 
 impl<T: ArenaObj> PartialEq for Ptr<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.idx == other.idx
+        self.owner == other.owner && self.idx == other.idx
     }
 }
 
@@ -326,6 +409,7 @@ impl<T: ArenaObj> Eq for Ptr<T> {}
 
 impl<T: ArenaObj + 'static> Hash for Ptr<T> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
         self.idx.hash(state);
     }
 }
@@ -343,7 +427,7 @@ impl<T: ArenaObj + Printable> Printable for Ptr<T> {
 
 impl<T: ArenaObj + Verify> Verify for Ptr<T> {
     fn verify(&self, ctx: &Context) -> Result<()> {
-        self.deref(ctx).verify(ctx)
+        self.try_deref(ctx)?.verify(ctx)
     }
 }
 
@@ -564,11 +648,63 @@ macro_rules! context_registration {
 
 #[cfg(test)]
 mod mutation_epoch_tests {
-    use super::{Context, private::ArenaObj};
+    use super::{
+        Context, ContextIdentityExhausted, DanglingPtrDerefError, ForeignContextPtrDerefError, Ptr,
+        private::ArenaObj, take_context_identity,
+    };
     use crate::{
-        basic_block::BasicBlock, builtin::types::UnitType, r#type::TypeHandle, uniqued_any,
+        basic_block::BasicBlock,
+        builtin::{
+            ops::ModuleOp,
+            types::{IntegerType, Signedness, UnitType},
+        },
+        linked_list::ContainsLinkedList,
+        op::Op,
+        operation::Operation,
+        region::Region,
+        r#type::TypeHandle,
+        uniqued_any,
+        value::{DefiningEntity, Value},
     };
     use alloc::vec;
+    use core::{num::NonZeroU64, panic::AssertUnwindSafe};
+
+    struct ArenaFixture {
+        operation: Ptr<Operation>,
+        region: Ptr<Region>,
+        block: Ptr<BasicBlock>,
+        value: Value,
+    }
+
+    fn arena_fixture(context: &mut Context, name: &str) -> ArenaFixture {
+        let module = ModuleOp::new(context, name.try_into().unwrap());
+        let operation = module.get_operation();
+        let region = operation.deref(context).get_region(0);
+        let block = region.deref(context).get_head().unwrap();
+        let ty: TypeHandle = IntegerType::get(context, 32, Signedness::Signless).into();
+        let value_block = BasicBlock::new(context, None, vec![ty]);
+        let value = value_block.deref(context).get_argument(0);
+        ArenaFixture {
+            operation,
+            region,
+            block,
+            value,
+        }
+    }
+
+    fn is_foreign_context_error(error: &crate::result::Error) -> bool {
+        error
+            .err
+            .downcast_ref::<ForeignContextPtrDerefError>()
+            .is_some()
+    }
+
+    fn expect_error<T>(result: crate::result::Result<T>) -> crate::result::Error {
+        match result {
+            Ok(_) => panic!("expected operation to fail"),
+            Err(error) => error,
+        }
+    }
 
     fn epoch(ctx: &Context) -> u64 {
         ctx.ir_mutation_attempt_epoch().unwrap().value()
@@ -639,5 +775,108 @@ mod mutation_epoch_tests {
         assert!(ctx.ir_mutation_attempt_epoch().is_err());
         ctx.note_ir_mutation_attempt();
         assert!(ctx.ir_mutation_attempt_epoch().is_err());
+    }
+
+    #[test]
+    fn context_identity_sequence_never_wraps_or_reuses() {
+        let mut next = NonZeroU64::new(u64::MAX);
+        let final_identity = take_context_identity(&mut next).unwrap();
+        assert_eq!(final_identity.0.get(), u64::MAX);
+        assert_eq!(next, None);
+        assert_eq!(
+            take_context_identity(&mut next),
+            Err(ContextIdentityExhausted)
+        );
+    }
+
+    #[test]
+    fn equal_slot_operations_regions_blocks_and_values_reject_foreign_contexts() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+
+        assert_eq!(owner_fixture.operation.idx, foreign_fixture.operation.idx);
+        assert_eq!(owner_fixture.region.idx, foreign_fixture.region.idx);
+        assert_eq!(owner_fixture.block.idx, foreign_fixture.block.idx);
+        let DefiningEntity::Block(owner_value_block) = owner_fixture.value.defining_entity else {
+            panic!("fixture value must be a block argument")
+        };
+        let DefiningEntity::Block(foreign_value_block) = foreign_fixture.value.defining_entity
+        else {
+            panic!("fixture value must be a block argument")
+        };
+        assert_eq!(owner_value_block.idx, foreign_value_block.idx);
+        assert_ne!(owner_fixture.operation, foreign_fixture.operation);
+        assert_ne!(owner_fixture.region, foreign_fixture.region);
+        assert_ne!(owner_fixture.block, foreign_fixture.block);
+        assert_ne!(owner_fixture.value, foreign_fixture.value);
+
+        for error in [
+            expect_error(owner_fixture.operation.try_deref(&foreign)),
+            expect_error(owner_fixture.region.try_deref(&foreign)),
+            expect_error(owner_fixture.block.try_deref(&foreign)),
+            expect_error(owner_fixture.value.try_find_index(&foreign)),
+        ] {
+            assert!(is_foreign_context_error(&error));
+        }
+
+        let before = epoch(&foreign);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                owner_fixture.operation.deref(&foreign)
+            }))
+            .is_err()
+        );
+        assert_eq!(epoch(&foreign), before);
+        let error = expect_error(owner_fixture.operation.try_deref_mut(&foreign));
+        assert!(is_foreign_context_error(&error));
+        assert_eq!(epoch(&foreign), before);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                owner_fixture.operation.deref_mut(&foreign)
+            }))
+            .is_err()
+        );
+        assert_eq!(epoch(&foreign), before);
+        assert!(foreign_fixture.operation.try_deref(&foreign).is_ok());
+        assert!(owner_fixture.operation.try_deref(&owner).is_ok());
+    }
+
+    #[test]
+    fn foreign_deallocation_rejects_before_indexing_or_mutating_either_context() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_block = BasicBlock::new(&mut owner, None, vec![]);
+        let foreign_block = BasicBlock::new(&mut foreign, None, vec![]);
+        assert_eq!(owner_block.idx, foreign_block.idx);
+
+        let owner_before = epoch(&owner);
+        let foreign_before = epoch(&foreign);
+        assert!(
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                ArenaObj::dealloc(owner_block, &mut foreign)
+            }))
+            .is_err()
+        );
+        assert_eq!(epoch(&owner), owner_before);
+        assert_eq!(epoch(&foreign), foreign_before);
+        assert!(owner_block.try_deref(&owner).is_ok());
+        assert!(foreign_block.try_deref(&foreign).is_ok());
+    }
+
+    #[test]
+    fn stale_pointer_remains_dangling_after_same_context_reallocation() {
+        let mut context = Context::try_new().unwrap();
+        let stale = BasicBlock::new(&mut context, None, vec![]);
+        ArenaObj::dealloc(stale, &mut context);
+
+        let error = expect_error(stale.try_deref(&context));
+        assert!(error.err.downcast_ref::<DanglingPtrDerefError>().is_some());
+        let replacement = BasicBlock::new(&mut context, None, vec![]);
+        assert_ne!(stale, replacement);
+        let error = expect_error(stale.try_deref(&context));
+        assert!(error.err.downcast_ref::<DanglingPtrDerefError>().is_some());
+        assert!(replacement.try_deref(&context).is_ok());
     }
 }
