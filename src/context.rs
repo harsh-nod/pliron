@@ -75,7 +75,7 @@ pub struct IrMutationAttemptEpochExhausted;
 pub struct ContextIdentityExhausted;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ContextIdentity(NonZeroU64);
+pub(crate) struct ContextIdentity(NonZeroU64);
 
 static NEXT_CONTEXT_IDENTITY: LazyLock<Mutex<Option<NonZeroU64>>> =
     LazyLock::new(|| Mutex::new(NonZeroU64::new(1)));
@@ -145,6 +145,10 @@ impl Context {
     pub fn try_new() -> core::result::Result<Context, ContextIdentityExhausted> {
         let identity = allocate_context_identity()?;
         Ok(Self::with_identity(identity))
+    }
+
+    pub(crate) fn identity(&self) -> ContextIdentity {
+        self.identity
     }
 
     /// Observe the current IR mutation-attempt epoch.
@@ -653,11 +657,14 @@ mod mutation_epoch_tests {
         private::ArenaObj, take_context_identity,
     };
     use crate::{
+        attribute::AttrObj,
         basic_block::BasicBlock,
         builtin::{
-            ops::ModuleOp,
-            types::{IntegerType, Signedness, UnitType},
+            attributes::{DictAttr, TypeAttr, VecAttr},
+            ops::{ConstantOp, FuncOp, ModuleOp},
+            types::{FunctionType, IntegerType, Signedness, UnitType},
         },
+        common_traits::Verify,
         graph::dominance::DomInfo,
         irbuild::dialect_conversion::{
             DialectConversion, DialectConversionRewriter, OperandsInfo, apply_dialect_conversion,
@@ -673,11 +680,11 @@ mod mutation_epoch_tests {
         opts::{dce::dce, mem2reg::mem2reg, simplify_cfg::simplify_cfg},
         pass::AnalysisManager,
         region::Region,
-        r#type::{TypeHandle, Typed},
+        r#type::{ForeignContextTypeHandleError, TypeHandle, Typed, TypedHandle},
         uniqued_any,
         value::{DefiningEntity, Use, Value},
     };
-    use alloc::{vec, vec::Vec};
+    use alloc::{boxed::Box, vec, vec::Vec};
     use core::{marker::PhantomData, num::NonZeroU64, panic::AssertUnwindSafe};
 
     struct ArenaFixture {
@@ -737,6 +744,13 @@ mod mutation_epoch_tests {
         error.err.downcast_ref::<DanglingPtrDerefError>().is_some()
     }
 
+    fn is_foreign_type_error(error: &crate::result::Error) -> bool {
+        error
+            .err
+            .downcast_ref::<ForeignContextTypeHandleError>()
+            .is_some()
+    }
+
     fn expect_error<T>(result: crate::result::Result<T>) -> crate::result::Error {
         match result {
             Ok(_) => panic!("expected operation to fail"),
@@ -746,6 +760,174 @@ mod mutation_epoch_tests {
 
     fn epoch(ctx: &Context) -> u64 {
         ctx.ir_mutation_attempt_epoch().unwrap().value()
+    }
+
+    macro_rules! assert_foreign_mutation_rejected {
+        ($owner:ident, $owner_fixture:ident, $foreign:ident, $foreign_fixture:ident, $action:block) => {{
+            let owner_epoch = epoch(&$owner);
+            let foreign_epoch = epoch(&$foreign);
+            let owner_graph = graph_snapshot(&$owner, &$owner_fixture);
+            let foreign_graph = graph_snapshot(&$foreign, &$foreign_fixture);
+            assert!(
+                std::panic::catch_unwind(AssertUnwindSafe(|| $action)).is_err(),
+                "foreign composite mutation unexpectedly succeeded"
+            );
+            assert_eq!(epoch(&$owner), owner_epoch);
+            assert_eq!(epoch(&$foreign), foreign_epoch);
+            assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
+            assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
+        }};
+    }
+
+    macro_rules! assert_foreign_result_rejected {
+        ($owner:ident, $owner_fixture:ident, $foreign:ident, $foreign_fixture:ident, $action:expr) => {{
+            let owner_epoch = epoch(&$owner);
+            let foreign_epoch = epoch(&$foreign);
+            let owner_graph = graph_snapshot(&$owner, &$owner_fixture);
+            let foreign_graph = graph_snapshot(&$foreign, &$foreign_fixture);
+            let error = expect_error($action);
+            assert!(is_foreign_context_error(&error));
+            assert_eq!(epoch(&$owner), owner_epoch);
+            assert_eq!(epoch(&$foreign), foreign_epoch);
+            assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
+            assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
+        }};
+    }
+
+    #[test]
+    fn equal_slot_type_handles_are_context_owned_and_fail_fallibly() {
+        let owner = Context::try_new().unwrap();
+        let foreign = Context::try_new().unwrap();
+        let owner_type: TypeHandle = IntegerType::get(&owner, 32, Signedness::Signless).into();
+        let foreign_type: TypeHandle = UnitType::get(&foreign).into();
+
+        assert_eq!(owner_type.storage_index(), foreign_type.storage_index());
+        assert_ne!(owner_type, foreign_type);
+        assert!(owner_type.try_deref(&owner).unwrap().is::<IntegerType>());
+        assert!(foreign_type.try_deref(&foreign).unwrap().is::<UnitType>());
+
+        let owner_epoch = epoch(&owner);
+        let foreign_epoch = epoch(&foreign);
+        for error in [
+            expect_error(foreign_type.try_deref(&owner)),
+            expect_error(foreign_type.try_deref_mut(&owner)),
+            expect_error(foreign_type.verify(&owner)),
+            expect_error(TypedHandle::<UnitType>::from_handle(foreign_type, &owner)),
+        ] {
+            assert!(is_foreign_type_error(&error));
+        }
+        assert_eq!(epoch(&owner), owner_epoch);
+        assert_eq!(epoch(&foreign), foreign_epoch);
+
+        let same_owner = Context::try_new().unwrap();
+        let same_foreign = Context::try_new().unwrap();
+        let same_owner_type: TypeHandle =
+            IntegerType::get(&same_owner, 32, Signedness::Signless).into();
+        let same_foreign_type: TypeHandle =
+            IntegerType::get(&same_foreign, 32, Signedness::Signless).into();
+        assert_eq!(
+            same_owner_type.storage_index(),
+            same_foreign_type.storage_index()
+        );
+        assert_ne!(same_owner_type, same_foreign_type);
+        let error = expect_error(same_foreign_type.try_preflight(&same_owner));
+        assert!(is_foreign_type_error(&error));
+    }
+
+    #[test]
+    fn equal_slot_foreign_types_are_rejected_before_core_ir_mutation() {
+        let mut owner = Context::try_new().unwrap();
+        let mut foreign = Context::try_new().unwrap();
+        let owner_type: TypeHandle = IntegerType::get(&owner, 32, Signedness::Signless).into();
+        let foreign_type: TypeHandle = UnitType::get(&foreign).into();
+        assert_eq!(owner_type.storage_index(), foreign_type.storage_index());
+        let owner_fixture = arena_fixture(&mut owner, "owner");
+        let foreign_fixture = arena_fixture(&mut foreign, "foreign");
+
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::new(
+                &mut owner,
+                ModuleOp::get_concrete_op_info(),
+                vec![owner_type, foreign_type],
+                vec![],
+                vec![],
+                0,
+            )
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            BasicBlock::new(&mut owner, None, vec![owner_type, foreign_type])
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::push_result(owner_fixture.operation, &owner, foreign_type)
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            Operation::insert_result(owner_fixture.operation, &owner, 0, foreign_type)
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            BasicBlock::push_argument(owner_fixture.block, &owner, foreign_type)
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            BasicBlock::insert_argument(owner_fixture.block, &owner, 0, foreign_type)
+        });
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            owner_fixture.value.set_type(&owner, foreign_type)
+        });
+        let mut rewriter = IRRewriter::<Recorder>::default();
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            rewriter.set_value_type(&owner, owner_fixture.value, foreign_type)
+        });
+        assert!(rewriter.get_listener().events.is_empty());
+        assert!(!rewriter.is_modified());
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            FunctionType::get(&owner, vec![owner_type], vec![foreign_type])
+        });
+
+        let type_attr = TypeAttr::new(foreign_type);
+        let error = expect_error(type_attr.verify(&owner));
+        assert!(is_foreign_type_error(&error));
+
+        let foreign_function_type = FunctionType::get(&foreign, vec![], vec![]);
+        assert_foreign_mutation_rejected!(owner, owner_fixture, foreign, foreign_fixture, {
+            FuncOp::new(
+                &mut owner,
+                "foreign_type_func".try_into().unwrap(),
+                foreign_function_type,
+            )
+        });
+
+        let owner_function_type = FunctionType::get(&owner, vec![], vec![]);
+        let owner_function = FuncOp::new(
+            &mut owner,
+            "owner_type_func".try_into().unwrap(),
+            owner_function_type,
+        );
+        let old_function_type = owner_function.get_attr_func_type(&owner).unwrap().clone();
+        let owner_epoch = epoch(&owner);
+        let error = expect_error(
+            owner_function.try_set_attr_func_type(&owner, TypeAttr::new(foreign_type)),
+        );
+        assert!(is_foreign_type_error(&error));
+        assert_eq!(epoch(&owner), owner_epoch);
+        assert_eq!(
+            *owner_function.get_attr_func_type(&owner).unwrap(),
+            old_function_type
+        );
+
+        let owner_constant =
+            ConstantOp::new(&mut owner, Box::new(TypeAttr::new(owner_type)) as AttrObj);
+        let nested_foreign_attr: AttrObj =
+            Box::new(VecAttr::new(vec![Box::new(DictAttr::new(vec![(
+                "foreign_type".try_into().unwrap(),
+                Box::new(TypeAttr::new(foreign_type)) as AttrObj,
+            )])) as AttrObj]));
+        let old_value = owner_constant.get_value(&owner);
+        let owner_epoch = epoch(&owner);
+        let error = expect_error(
+            owner_constant.try_set_attr_builtin_constant_value(&owner, nested_foreign_attr),
+        );
+        assert!(is_foreign_type_error(&error));
+        assert_eq!(epoch(&owner), owner_epoch);
+        assert!(owner_constant.get_value(&owner) == old_value);
     }
 
     fn graph_snapshot(context: &Context, fixture: &ArenaFixture) -> ArenaGraphSnapshot {
@@ -791,38 +973,6 @@ mod mutation_epoch_tests {
             block_uses: fixture.block.uses(context),
             value_uses: fixture.value.uses(context),
         }
-    }
-
-    macro_rules! assert_foreign_mutation_rejected {
-        ($owner:ident, $owner_fixture:ident, $foreign:ident, $foreign_fixture:ident, $action:block) => {{
-            let owner_epoch = epoch(&$owner);
-            let foreign_epoch = epoch(&$foreign);
-            let owner_graph = graph_snapshot(&$owner, &$owner_fixture);
-            let foreign_graph = graph_snapshot(&$foreign, &$foreign_fixture);
-            assert!(
-                std::panic::catch_unwind(AssertUnwindSafe(|| $action)).is_err(),
-                "foreign composite mutation unexpectedly succeeded"
-            );
-            assert_eq!(epoch(&$owner), owner_epoch);
-            assert_eq!(epoch(&$foreign), foreign_epoch);
-            assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
-            assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
-        }};
-    }
-
-    macro_rules! assert_foreign_result_rejected {
-        ($owner:ident, $owner_fixture:ident, $foreign:ident, $foreign_fixture:ident, $action:expr) => {{
-            let owner_epoch = epoch(&$owner);
-            let foreign_epoch = epoch(&$foreign);
-            let owner_graph = graph_snapshot(&$owner, &$owner_fixture);
-            let foreign_graph = graph_snapshot(&$foreign, &$foreign_fixture);
-            let error = expect_error($action);
-            assert!(is_foreign_context_error(&error));
-            assert_eq!(epoch(&$owner), owner_epoch);
-            assert_eq!(epoch(&$foreign), foreign_epoch);
-            assert!(graph_snapshot(&$owner, &$owner_fixture) == owner_graph);
-            assert!(graph_snapshot(&$foreign, &$foreign_fixture) == foreign_graph);
-        }};
     }
 
     struct MustNotConvert;

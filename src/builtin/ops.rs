@@ -166,6 +166,7 @@ impl FuncOp {
     /// Create a new [FuncOp].
     /// The returned function has a single region with an empty `entry` block.
     pub fn new(ctx: &mut Context, name: Identifier, ty: TypedHandle<FunctionType>) -> Self {
+        ty.verify(ctx).expect("FuncOp type preflight failed");
         let ty_attr = TypeAttr::new(ty.into());
         let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 1);
 
@@ -312,6 +313,9 @@ impl ConstantOp {
 
     /// Create a new [ConstantOp].
     pub fn new(ctx: &mut Context, value: AttrObj) -> Self {
+        value
+            .verify(ctx)
+            .expect("ConstantOp attribute preflight failed");
         let result_type = attr_cast::<dyn TypedAttrInterface>(&*value)
             .expect("ConstantOp const value must provide TypedAttrInterface")
             .get_type(ctx);

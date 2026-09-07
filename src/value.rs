@@ -297,6 +297,7 @@ impl Value {
     /// Set this value's type.
     pub fn set_type(&self, ctx: &Context, ty: TypeHandle) {
         let index = self.find_index(ctx);
+        ty.preflight(ctx);
         match self.defining_entity {
             DefiningEntity::Op(op) => op.deref_mut(ctx).results[index].set_type(ty),
             DefiningEntity::Block(block) => block.deref_mut(ctx).args[index].set_type(ty),

@@ -1228,6 +1228,7 @@ pub trait CallOpInterface {
 
     /// Set callee type
     fn set_callee_type(&self, ctx: &mut Context, callee_ty: TypeHandle) {
+        callee_ty.preflight(ctx);
         let mut self_op = self.get_operation().deref_mut(ctx);
         let ty_attr = TypeAttr::new(callee_ty);
         self_op

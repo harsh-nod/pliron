@@ -266,10 +266,16 @@ pub(crate) fn derive_attr_get_set(
         // Build the getter and setter methods for the attribute.
         let fn_name_get = format_ident!("get_attr_{}", attr_name);
         let fn_name_set = format_ident!("set_attr_{}", attr_name);
+        let fn_name_try_set = format_ident!("try_set_attr_{}", attr_name);
         let fn_comment_get = format!(
             "Get a [Ref](core::cell::Ref) to the value of the attribute named `{attr_name}`."
         );
-        let fn_comment_set = format!("Set the value of the attribute named `{attr_name}`.");
+        let fn_comment_set = format!(
+            "Set the value of the attribute named `{attr_name}`. Panics if preflight fails."
+        );
+        let fn_comment_try_set = format!(
+            "Try to set the value of the attribute named `{attr_name}` after fallible preflight."
+        );
         let get_set_fns = if let Some(ty) = ty_opt {
             quote! {
                 #[doc = #fn_comment_get]
@@ -283,7 +289,22 @@ pub(crate) fn derive_attr_get_set(
 
                 #[doc = #fn_comment_set]
                 pub fn #fn_name_set(&self, ctx: &::pliron::context::Context, value: #ty) {
-                    self.op.deref_mut(ctx).attributes.set(#module_name::#attr_name_const.clone(), value);
+                    self.#fn_name_try_set(ctx, value)
+                        .expect("Operation attribute preflight failed");
+                }
+
+                #[doc = #fn_comment_try_set]
+                pub fn #fn_name_try_set(
+                    &self,
+                    ctx: &::pliron::context::Context,
+                    value: #ty,
+                ) -> ::pliron::result::Result<()> {
+                    ::core::mem::drop(self.op.try_deref(ctx)?);
+                    ::pliron::attribute::verify_attr(&value, ctx)?;
+                    self.op.try_deref_mut(ctx)?
+                        .attributes
+                        .set(#module_name::#attr_name_const.clone(), value);
+                    ::core::result::Result::Ok(())
                 }
             }
         } else {
@@ -302,8 +323,21 @@ pub(crate) fn derive_attr_get_set(
                     (&self, ctx: &::pliron::context::Context,
                     value: ::pliron::attribute::AttrObj)
                 {
-                    self.op.deref_mut(ctx).attributes
+                    self.#fn_name_try_set(ctx, value)
+                        .expect("Operation attribute preflight failed");
+                }
+
+                #[doc = #fn_comment_try_set]
+                pub fn #fn_name_try_set
+                    (&self, ctx: &::pliron::context::Context,
+                    value: ::pliron::attribute::AttrObj)
+                    -> ::pliron::result::Result<()>
+                {
+                    ::core::mem::drop(self.op.try_deref(ctx)?);
+                    ::pliron::attribute::verify_attr(&*value, ctx)?;
+                    self.op.try_deref_mut(ctx)?.attributes
                         .0.insert(#module_name::#attr_name_const.clone(), value);
+                    ::core::result::Result::Ok(())
                 }
             }
         };

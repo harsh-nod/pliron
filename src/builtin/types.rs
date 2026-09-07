@@ -11,10 +11,12 @@ use crate::{
         Parser, choice,
         parser::char::{spaces, string},
     },
+    common_traits::Verify,
     context::Context,
     irfmt::parsers::int_parser,
     parsable::{Parsable, ParseResult, StateStream},
     printable::{self, Printable},
+    result::Result,
     r#type::{Type, TypeHandle, TypeSig, TypedHandle},
     utils::apfloat::{self, GetSemantics, Semantics},
 };
@@ -106,7 +108,7 @@ impl Printable for IntegerType {
 ///
 /// See MLIR's [FunctionType](https://mlir.llvm.org/docs/Dialects/Builtin/#functiontype).
 ///
-#[pliron_type(name = "builtin.function", format = "`<` $0 `>`", verifier = "succ")]
+#[pliron_type(name = "builtin.function", format = "`<` $0 `>`")]
 #[derive(Hash, PartialEq, Eq, Debug)]
 pub struct FunctionType(TypeSig);
 
@@ -117,7 +119,20 @@ impl FunctionType {
         arguments: Vec<TypeHandle>,
         results: Vec<TypeHandle>,
     ) -> TypedHandle<Self> {
+        for ty in arguments.iter().chain(&results) {
+            ty.preflight(ctx);
+        }
         FunctionType::instantiate(FunctionType(TypeSig { arguments, results }), ctx)
+    }
+}
+
+impl Verify for FunctionType {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0
+            .arguments
+            .iter()
+            .chain(&self.0.results)
+            .try_for_each(|ty| ty.verify(ctx))
     }
 }
 
@@ -181,7 +196,7 @@ mod tests {
         context::Context,
         parsable::parse_from_str,
         result::ExpectOk,
-        r#type::Type,
+        r#type::{ForeignContextTypeHandleError, Type, TypeHandle},
     };
 
     #[test]
@@ -221,6 +236,34 @@ mod tests {
             ft_ref.arg_types()[0] == int32_1_ptr.into()
                 && ft_ref.res_types()[0] == int64_ptr.into()
         );
+    }
+
+    #[test]
+    fn forged_function_signature_rejects_foreign_nested_type() {
+        let owner = Context::try_new().unwrap();
+        let foreign = Context::try_new().unwrap();
+        let owner_type: TypeHandle = IntegerType::get(&owner, 32, Signedness::Signless).into();
+        let foreign_type: TypeHandle = UnitType::get(&foreign).into();
+        assert_eq!(owner_type.storage_index(), foreign_type.storage_index());
+
+        // Bypass FunctionType::get inside this private module to model a
+        // malformed recursive-type mutation at the direct Pliron TCB surface.
+        let forged = FunctionType::instantiate(
+            FunctionType(TypeSig {
+                arguments: vec![foreign_type],
+                results: vec![],
+            }),
+            &owner,
+        );
+        let before_epoch = owner.ir_mutation_attempt_epoch().unwrap();
+        let error = forged.verify(&owner).unwrap_err();
+        assert!(
+            error
+                .err
+                .downcast_ref::<ForeignContextTypeHandleError>()
+                .is_some()
+        );
+        assert_eq!(owner.ir_mutation_attempt_epoch().unwrap(), before_epoch);
     }
 
     #[test]

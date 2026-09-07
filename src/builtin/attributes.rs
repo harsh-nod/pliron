@@ -235,7 +235,7 @@ pub struct IntegerAttrBitwidthErr;
 
 impl Verify for IntegerAttr {
     fn verify(&self, ctx: &Context) -> Result<()> {
-        if self.ty.deref(ctx).width() as usize != self.val.bw() {
+        if self.ty.try_deref(ctx)?.width() as usize != self.val.bw() {
             return verify_err_noloc!(IntegerAttrBitwidthErr);
         }
         Ok(())
@@ -520,9 +520,15 @@ impl MaterializableAttr for FPDoubleAttr {
 
 /// An attribute that is a dictionary of other attributes.
 /// Similar to MLIR's [DictionaryAttr](https://mlir.llvm.org/docs/Dialects/Builtin/#dictionaryattr),
-#[pliron_attr(name = "builtin.dict", verifier = "succ")]
+#[pliron_attr(name = "builtin.dict")]
 #[derive(PartialEq, Clone, Eq, Debug, Hash)]
 pub struct DictAttr(pub AttributeDict);
+
+impl Verify for DictAttr {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0.verify(ctx)
+    }
+}
 
 impl Printable for DictAttr {
     fn fmt(
@@ -612,9 +618,15 @@ impl UnitAttr {
 
 /// An attribute that does nothing but hold a Type.
 /// Same as MLIR's [TypeAttr](https://mlir.llvm.org/docs/Dialects/Builtin/#typeattr).
-#[pliron_attr(name = "builtin.type", format = "$0", verifier = "succ")]
+#[pliron_attr(name = "builtin.type", format = "$0")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct TypeAttr(TypeHandle);
+
+impl Verify for TypeAttr {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0.verify(ctx)
+    }
+}
 
 impl TypeAttr {
     pub fn new(ty: TypeHandle) -> Self {

@@ -148,6 +148,12 @@ pub type AttributeDictContainer = SmallMap<Identifier, AttrObj, 1>;
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct AttributeDict(pub AttributeDictContainer);
 
+impl Verify for AttributeDict {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0.values().try_for_each(|attr| attr.verify(ctx))
+    }
+}
+
 impl Hash for AttributeDict {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Sort by key so that the hash doesn't depend on insertion order.

@@ -39,7 +39,7 @@
 //! [downcast_rs](https://docs.rs/downcast-rs/latest/downcast_rs/#example-without-generics).
 
 use crate::{
-    arg_err_noloc,
+    arg_err_noloc, arg_error_noloc,
     combine::{Parser, parser},
     common_traits::Verify,
     context::{Context, collect_deduped_interface_verifiers},
@@ -115,7 +115,7 @@ pub trait Type: Printable + Verify + Downcast + Sync + Send + Debug {
             .type_store
             .get(self.hash_type(), &is)
             .expect("Unregistered type object in existence");
-        TypeHandle(idx)
+        TypeHandle::new(ctx, idx)
     }
 
     /// Instantiate a type in the provided [Context], returning a [TypeHandle] to self.
@@ -130,7 +130,7 @@ pub trait Type: Printable + Verify + Downcast + Sync + Send + Debug {
             &TypeObj::eq,
             || ctx.note_ir_mutation_attempt(),
         );
-        TypedHandle(TypeHandle(idx), PhantomData::<Self>)
+        TypedHandle(TypeHandle::new(ctx, idx), PhantomData::<Self>)
     }
 
     /// Get a Type's static name. This is *not* per instantiation of the type.
@@ -333,32 +333,133 @@ impl Hash for TypeObj {
 }
 
 /// A handle to the uniqued [Type] objects stored in the [Context].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TypeHandle(usize);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeHandle {
+    owner: crate::context::ContextIdentity,
+    index: usize,
+}
+
+impl core::fmt::Debug for TypeHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "TypeHandle({})", self.index)
+    }
+}
+
+/// A [TypeHandle] was paired with a [Context] that does not own it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("attempt to dereference a TypeHandle with a non-owning Context")]
+pub struct ForeignContextTypeHandleError;
 
 impl TypeHandle {
+    fn new(ctx: &Context, index: usize) -> Self {
+        Self {
+            owner: ctx.identity(),
+            index,
+        }
+    }
+
+    fn is_owned_by(&self, ctx: &Context) -> bool {
+        self.owner == ctx.identity()
+    }
+
+    #[track_caller]
+    pub(crate) fn assert_owner(&self, ctx: &Context) {
+        assert!(
+            self.is_owned_by(ctx),
+            "Attempt to use a TypeHandle with a non-owning Context"
+        );
+    }
+
+    /// Validate that this handle belongs to `ctx` without running arbitrary
+    /// type verifier callbacks.
+    pub fn try_preflight(&self, ctx: &Context) -> Result<()> {
+        self.require_owner(ctx)
+    }
+
+    #[track_caller]
+    pub(crate) fn preflight(&self, ctx: &Context) {
+        self.try_preflight(ctx)
+            .expect("TypeHandle preflight failed");
+    }
+
+    fn require_owner(&self, ctx: &Context) -> Result<()> {
+        if self.is_owned_by(ctx) {
+            Ok(())
+        } else {
+            Err(arg_error_noloc!(ForeignContextTypeHandleError))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_index(&self) -> usize {
+        self.index
+    }
+
     /// Get a reference to the underlying [Type] object.
     pub fn deref<'a>(&self, ctx: &'a Context) -> Ref<'a, dyn Type> {
+        self.assert_owner(ctx);
         Ref::map(
-            ctx.type_store.unique_store.get(self.0).unwrap().0.borrow(),
+            ctx.type_store
+                .unique_store
+                .get(self.index)
+                .unwrap()
+                .0
+                .borrow(),
             |t| &**t,
         )
+    }
+
+    /// Try to borrow the underlying [Type] object.
+    ///
+    /// Returns a typed error when this handle belongs to another [Context].
+    pub fn try_deref<'a>(&self, ctx: &'a Context) -> Result<Ref<'a, dyn Type>> {
+        self.require_owner(ctx)?;
+        let object = ctx
+            .type_store
+            .unique_store
+            .get(self.index)
+            .expect("TypeHandle index must name its immutable uniqued type");
+        Ok(Ref::map(
+            object.0.try_borrow().map_err(|err| arg_error_noloc!(err))?,
+            |t| &**t,
+        ))
     }
 
     /// Get a mutable reference to the underlying [Type] object.
     /// This is useful when building recursive types, and the caller must ensure
     /// that the mutation does not change the hash-relevant contents of the type.
     pub fn deref_mut<'a>(&self, ctx: &'a Context) -> RefMut<'a, dyn Type> {
+        self.assert_owner(ctx);
         ctx.note_ir_mutation_attempt();
         RefMut::map(
             ctx.type_store
                 .unique_store
-                .get(self.0)
+                .get(self.index)
                 .unwrap()
                 .0
                 .borrow_mut(),
             |t| &mut **t,
         )
+    }
+
+    /// Try to mutably borrow the underlying [Type] object.
+    ///
+    /// Ownership is checked before the context mutation-attempt epoch advances.
+    pub fn try_deref_mut<'a>(&self, ctx: &'a Context) -> Result<RefMut<'a, dyn Type>> {
+        self.require_owner(ctx)?;
+        ctx.note_ir_mutation_attempt();
+        let object = ctx
+            .type_store
+            .unique_store
+            .get(self.index)
+            .expect("TypeHandle index must name its immutable uniqued type");
+        Ok(RefMut::map(
+            object
+                .0
+                .try_borrow_mut()
+                .map_err(|err| arg_error_noloc!(err))?,
+            |t| &mut **t,
+        ))
     }
 }
 
@@ -376,7 +477,7 @@ impl Printable for TypeHandle {
 
 impl Verify for TypeHandle {
     fn verify(&self, ctx: &Context) -> Result<()> {
-        verify_type(&*self.deref(ctx), ctx)
+        verify_type(&*self.try_deref(ctx)?, ctx)
     }
 }
 
@@ -451,9 +552,17 @@ impl<T: Type> TypedHandle<T> {
         })
     }
 
+    /// Try to borrow the statically marked [Type].
+    pub fn try_deref<'a>(&self, ctx: &'a Context) -> Result<Ref<'a, T>> {
+        Ok(Ref::map(self.0.try_deref(ctx)?, |t| {
+            t.downcast_ref::<T>()
+                .expect("Type mismatch, inconsistent TypedHandle")
+        }))
+    }
+
     /// Create a new [TypedHandle] from a [TypeHandle].
     pub fn from_handle(handle: TypeHandle, ctx: &Context) -> Result<TypedHandle<T>> {
-        if handle.deref(ctx).is::<T>() {
+        if handle.try_deref(ctx)?.is::<T>() {
             Ok(TypedHandle(handle, PhantomData::<T>))
         } else {
             arg_err_noloc!(TypedHandleErr {
@@ -539,7 +648,7 @@ impl<T: Type + Parsable<Arg = (), Parsed = TypedHandle<T>>> Parsable for TypedHa
 
 impl<T: Type> Verify for TypedHandle<T> {
     fn verify(&self, ctx: &Context) -> Result<()> {
-        self.0.deref(ctx).verify(ctx)
+        self.try_deref(ctx)?.verify(ctx)
     }
 }
 

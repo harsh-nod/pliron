@@ -246,9 +246,15 @@ pub struct AlignmentAttr(pub u32);
 pub struct AddressSpaceAttr(pub u32);
 
 /// The "zero" value of a type: a null pointer, or an all-zero-bits aggregate.
-#[pliron_attr(name = "llvm.zero", format = "$0", verifier = "succ")]
+#[pliron_attr(name = "llvm.zero", format = "$0")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct ZeroAttr(pub TypeHandle);
+
+impl Verify for ZeroAttr {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0.try_preflight(ctx)
+    }
+}
 
 impl TypedAttrInterface for ZeroAttr {
     fn get_type(&self, _ctx: &Context) -> TypeHandle {
@@ -257,9 +263,15 @@ impl TypedAttrInterface for ZeroAttr {
 }
 
 /// The `undef` value of a type.
-#[pliron_attr(name = "llvm.undef", format = "$0", verifier = "succ")]
+#[pliron_attr(name = "llvm.undef", format = "$0")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct UndefAttr(pub TypeHandle);
+
+impl Verify for UndefAttr {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0.try_preflight(ctx)
+    }
+}
 
 impl TypedAttrInterface for UndefAttr {
     fn get_type(&self, _ctx: &Context) -> TypeHandle {
@@ -268,9 +280,15 @@ impl TypedAttrInterface for UndefAttr {
 }
 
 /// The `poison` value of a type.
-#[pliron_attr(name = "llvm.poison", format = "$0", verifier = "succ")]
+#[pliron_attr(name = "llvm.poison", format = "$0")]
 #[derive(PartialEq, Eq, Clone, Debug, Hash)]
 pub struct PoisonAttr(pub TypeHandle);
+
+impl Verify for PoisonAttr {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.0.try_preflight(ctx)
+    }
+}
 
 impl TypedAttrInterface for PoisonAttr {
     fn get_type(&self, _ctx: &Context) -> TypeHandle {

@@ -593,6 +593,9 @@ impl Operation {
     ) -> Ptr<Operation> {
         // Authenticate every externally supplied IR object before allocating
         // the operation or assigning any use IDs.
+        for ty in &result_types {
+            ty.preflight(ctx);
+        }
         for operand in &operands {
             drop(operand.get_defnode_ref(ctx));
         }
@@ -671,6 +674,7 @@ impl Operation {
     /// Add a result to the end of the result list, returning its index.
     pub fn push_result(this: Ptr<Self>, ctx: &Context, ty: TypeHandle) -> usize {
         drop(this.deref(ctx));
+        ty.preflight(ctx);
         let new_result = OpResult::new(ctx, ty);
         this.deref_mut(ctx).results.push_back(new_result)
     }
@@ -691,6 +695,7 @@ impl Operation {
     /// Panics on invalid index.
     pub fn insert_result(this: Ptr<Self>, ctx: &Context, res_idx: usize, ty: TypeHandle) {
         assert!(res_idx <= this.deref(ctx).results.len());
+        ty.preflight(ctx);
         let new_res = OpResult::new(ctx, ty);
         this.deref_mut(ctx).results.insert(res_idx, new_res);
         debug_info::insert_operation_result_name(ctx, this, res_idx, None);

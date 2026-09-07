@@ -60,6 +60,11 @@ impl StructType {
         name: Identifier,
         fields: Option<Vec<TypeHandle>>,
     ) -> Result<TypedHandle<Self>> {
+        if let Some(fields) = &fields {
+            fields
+                .iter()
+                .try_for_each(|field| field.try_preflight(ctx))?;
+        }
         let self_handle = Type::instantiate(
             StructType {
                 name: Some(name.clone()),
@@ -90,6 +95,11 @@ impl StructType {
     /// Get or create a new unnamed (anonymous) struct.
     /// These are finalized upon creation, and uniqued based on the fields.
     pub fn get_unnamed(ctx: &Context, fields: Vec<TypeHandle>) -> TypedHandle<Self> {
+        fields.iter().for_each(|field| {
+            field
+                .try_preflight(ctx)
+                .expect("StructType field preflight failed")
+        });
         Type::instantiate(
             StructType {
                 name: None,
@@ -148,9 +158,14 @@ pub enum StructErr {
 }
 
 impl Verify for StructType {
-    fn verify(&self, _ctx: &Context) -> Result<()> {
+    fn verify(&self, ctx: &Context) -> Result<()> {
         if self.name.is_none() && self.fields.is_none() {
             verify_err_noloc!(StructErr::OpaqueAndAnonymousErr)?
+        }
+        if let Some(fields) = &self.fields {
+            fields
+                .iter()
+                .try_for_each(|field| field.try_preflight(ctx))?;
         }
         Ok(())
     }
@@ -320,12 +335,7 @@ impl PointerType {
 }
 
 /// Array type, corresponding to LLVM's array type.
-#[pliron_type(
-    name = "llvm.array",
-    generate_get = true,
-    format = "`[` $size ` x ` $elem `]`",
-    verifier = "succ"
-)]
+#[pliron_type(name = "llvm.array", format = "`[` $size ` x ` $elem `]`")]
 #[derive(Hash, PartialEq, Eq, Debug)]
 pub struct ArrayType {
     elem: TypeHandle,
@@ -333,6 +343,13 @@ pub struct ArrayType {
 }
 
 impl ArrayType {
+    /// Get or create an array type.
+    pub fn get(ctx: &Context, elem: TypeHandle, size: u64) -> TypedHandle<Self> {
+        elem.try_preflight(ctx)
+            .expect("ArrayType element preflight failed");
+        Type::instantiate(ArrayType { elem, size }, ctx)
+    }
+
     /// Get array element type.
     pub fn elem_type(&self) -> TypeHandle {
         self.elem
@@ -344,15 +361,19 @@ impl ArrayType {
     }
 }
 
+impl Verify for ArrayType {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.elem.try_preflight(ctx)
+    }
+}
+
 #[pliron_type(name = "llvm.void", generate_get = true, format, verifier = "succ")]
 #[derive(Hash, PartialEq, Eq, Debug)]
 pub struct VoidType;
 
 #[pliron_type(
     name = "llvm.func",
-    generate_get = true,
-    format = "`<` $res `(` vec($args, CharSpace(`,`)) `) variadic = ` $is_var_arg `>`",
-    verifier = "succ"
+    format = "`<` $res `(` vec($args, CharSpace(`,`)) `) variadic = ` $is_var_arg `>`"
 )]
 #[derive(Hash, PartialEq, Eq, Debug)]
 pub struct FuncType {
@@ -368,6 +389,29 @@ pub enum FuncTypeErr {
 }
 
 impl FuncType {
+    /// Get or create a function type.
+    pub fn get(
+        ctx: &Context,
+        res: TypeHandle,
+        args: Vec<TypeHandle>,
+        is_var_arg: bool,
+    ) -> TypedHandle<Self> {
+        res.try_preflight(ctx)
+            .expect("FuncType result preflight failed");
+        args.iter().for_each(|arg| {
+            arg.try_preflight(ctx)
+                .expect("FuncType argument preflight failed")
+        });
+        Type::instantiate(
+            FuncType {
+                res,
+                args,
+                is_var_arg,
+            },
+            ctx,
+        )
+    }
+
     /// Result type
     pub fn result_type(&self) -> TypeHandle {
         self.res
@@ -376,6 +420,13 @@ impl FuncType {
     /// Is this a variadic function type?
     pub fn is_var_arg(&self) -> bool {
         self.is_var_arg
+    }
+}
+
+impl Verify for FuncType {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.res.try_preflight(ctx)?;
+        self.args.iter().try_for_each(|arg| arg.try_preflight(ctx))
     }
 }
 
@@ -400,9 +451,7 @@ pub enum VectorTypeKind {
 
 #[pliron_type(
     name = "llvm.vector",
-    generate_get = true,
-    format = "`<` $kind ` x ` $num_elems ` x ` $elem_ty `>`",
-    verifier = "succ"
+    format = "`<` $kind ` x ` $num_elems ` x ` $elem_ty `>`"
 )]
 #[derive(Hash, PartialEq, Eq, Debug)]
 pub struct VectorType {
@@ -412,6 +461,26 @@ pub struct VectorType {
 }
 
 impl VectorType {
+    /// Get or create a vector type.
+    pub fn get(
+        ctx: &Context,
+        elem_ty: TypeHandle,
+        num_elems: u32,
+        kind: VectorTypeKind,
+    ) -> TypedHandle<Self> {
+        elem_ty
+            .try_preflight(ctx)
+            .expect("VectorType element preflight failed");
+        Type::instantiate(
+            VectorType {
+                elem_ty,
+                num_elems,
+                kind,
+            },
+            ctx,
+        )
+    }
+
     /// Get the element type.
     pub fn elem_type(&self) -> TypeHandle {
         self.elem_ty
@@ -433,16 +502,28 @@ impl VectorType {
     }
 }
 
+impl Verify for VectorType {
+    fn verify(&self, ctx: &Context) -> Result<()> {
+        self.elem_ty.try_preflight(ctx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
 
     use alloc::{format, string::ToString, vec};
+    use core::panic::AssertUnwindSafe;
 
-    use crate::types::{FuncType, PointerType, StructType, VoidType};
+    use crate::attributes::{PoisonAttr, UndefAttr, ZeroAttr};
+    use crate::types::{
+        ArrayType, FuncType, PointerType, StructType, VectorType, VectorTypeKind, VoidType,
+    };
     use expect_test::expect;
     use pliron::{
-        builtin::types::{IntegerType, Signedness},
+        builtin::types::{IntegerType, Signedness, UnitType},
         combine::{self, Parser, eof, token},
+        common_traits::Verify,
         context::Context,
         derive::{pliron_type, verify_succ},
         identifier::Identifier,
@@ -450,7 +531,7 @@ mod tests {
         parsable::{Parsable, ParseResult, StateStream, parse_from_str},
         printable::{self, Printable},
         result::{ExpectOk, Result},
-        r#type::{TypeHandle, TypedHandle},
+        r#type::{ForeignContextTypeHandleError, TypeHandle, TypedHandle},
     };
 
     #[test]
@@ -497,6 +578,64 @@ mod tests {
         assert!(head_struct == head_struct2);
 
         Ok(())
+    }
+
+    #[test]
+    fn composite_types_reject_equal_slot_foreign_handles_before_mutation() {
+        let owner = Context::try_new().unwrap();
+        let foreign = Context::try_new().unwrap();
+        let owner_type: TypeHandle = IntegerType::get(&owner, 32, Signedness::Signless).into();
+        let foreign_type: TypeHandle = UnitType::get(&foreign).into();
+        assert_eq!(format!("{owner_type:?}"), format!("{foreign_type:?}"));
+        assert_ne!(owner_type, foreign_type);
+
+        let before_epoch = owner.ir_mutation_attempt_epoch().unwrap();
+        let error = StructType::get_named(
+            &owner,
+            "ForeignField".try_into().unwrap(),
+            Some(vec![foreign_type]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .err
+                .downcast_ref::<ForeignContextTypeHandleError>()
+                .is_some()
+        );
+        assert_eq!(owner.ir_mutation_attempt_epoch().unwrap(), before_epoch);
+
+        macro_rules! assert_rejected_without_mutation {
+            ($constructor:block) => {{
+                assert!(std::panic::catch_unwind(AssertUnwindSafe(|| $constructor)).is_err());
+                assert_eq!(owner.ir_mutation_attempt_epoch().unwrap(), before_epoch);
+            }};
+        }
+        assert_rejected_without_mutation!({
+            StructType::get_unnamed(&owner, vec![foreign_type]);
+        });
+        assert_rejected_without_mutation!({
+            ArrayType::get(&owner, foreign_type, 4);
+        });
+        assert_rejected_without_mutation!({
+            FuncType::get(&owner, owner_type, vec![foreign_type], false);
+        });
+        assert_rejected_without_mutation!({
+            VectorType::get(&owner, foreign_type, 4, VectorTypeKind::Fixed);
+        });
+
+        for error in [
+            ZeroAttr(foreign_type).verify(&owner).unwrap_err(),
+            UndefAttr(foreign_type).verify(&owner).unwrap_err(),
+            PoisonAttr(foreign_type).verify(&owner).unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .err
+                    .downcast_ref::<ForeignContextTypeHandleError>()
+                    .is_some()
+            );
+        }
+        assert_eq!(owner.ir_mutation_attempt_epoch().unwrap(), before_epoch);
     }
 
     /// A pointer type that knows the type it points to.
