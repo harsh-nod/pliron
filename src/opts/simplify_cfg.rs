@@ -16,6 +16,7 @@
 //!    branch arguments of `A` into the formal arguments of `B`.
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     vec,
@@ -35,6 +36,7 @@ use crate::{
         IRStatus,
         inserter::{Inserter, OpInsertionPoint},
         listener::Recorder,
+        observer::{RewriteObserver, RewriteOccurrenceEvent},
         rewriter::{IRRewriter, Rewriter},
     },
     linked_list::{ContainsLinkedList, LinkedList},
@@ -124,6 +126,16 @@ fn try_merge_succ(
         actual_args.len(),
         "branch must forward one operand per successor block argument"
     );
+    if rewriter.observes_occurrences() {
+        rewriter.notify_occurrence(
+            ctx,
+            RewriteOccurrenceEvent::SuccessorBlockMerging {
+                predecessor: pred,
+                successor: succ,
+                terminator: pred_terminator,
+            },
+        );
+    }
     for (formal, actual) in formal_args.iter().zip(actual_args.iter()) {
         rewriter.replace_value_uses_with(ctx, *formal, *actual);
     }
@@ -243,6 +255,12 @@ fn remove_blocks_inside_region_impl(
 
     for dead_block in &dead_blocks {
         log::debug!("Removing unreachable block {}", dead_block.label(ctx));
+        if rewriter.observes_occurrences() {
+            rewriter.notify_occurrence(
+                ctx,
+                RewriteOccurrenceEvent::UnreachableBlockDroppingUses { block: *dead_block },
+            );
+        }
         BasicBlock::drop_all_uses(*dead_block, ctx);
     }
 
@@ -354,6 +372,23 @@ fn merge_inside_region_impl(
 
 /// Simplifies the CFG, as described in the module-level documentation.
 pub fn simplify_cfg(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
+    simplify_cfg_impl(op, ctx, None)
+}
+
+/// Run the same pass with independent mutation observations.
+pub fn simplify_cfg_with_observer(
+    op: Ptr<Operation>,
+    ctx: &mut Context,
+    observer: Box<dyn RewriteObserver>,
+) -> Result<IRStatus> {
+    simplify_cfg_impl(op, ctx, Some(observer))
+}
+
+fn simplify_cfg_impl(
+    op: Ptr<Operation>,
+    ctx: &mut Context,
+    observer: Option<Box<dyn RewriteObserver>>,
+) -> Result<IRStatus> {
     Operation::try_preflight_tree(op, ctx)?;
     let mut fold_candidates: Vec<(Ptr<Operation>, Vec<Option<AttrObj>>)> = Vec::new();
     walk_op(
@@ -372,6 +407,7 @@ pub fn simplify_cfg(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
     );
 
     let mut rewriter = IRRewriter::<Recorder>::default();
+    rewriter.set_observer(observer);
     let mut status = IRStatus::Unchanged;
     for (op, attrs) in fold_candidates {
         rewriter.set_insertion_point_before_operation(op);

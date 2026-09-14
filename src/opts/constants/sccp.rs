@@ -28,6 +28,7 @@
 //!    implement [MaterializableAttr], and replacing uses accordingly.
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
 };
@@ -46,6 +47,7 @@ use crate::{
         IRStatus,
         inserter::Inserter,
         listener::Recorder,
+        observer::RewriteObserver,
         rewriter::{IRRewriter, Rewriter},
     },
     linked_list::ContainsLinkedList,
@@ -182,6 +184,23 @@ fn process_val(val: Value, ctx: &Context, state: &mut SccpState) {
 
 /// Perform sparse conditional constant propagation on `op` and its nested operations.
 pub fn sccp(root_op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
+    sccp_impl(root_op, ctx, None)
+}
+
+/// Run the same pass with independent mutation observations.
+pub fn sccp_with_observer(
+    root_op: Ptr<Operation>,
+    ctx: &mut Context,
+    observer: Box<dyn RewriteObserver>,
+) -> Result<IRStatus> {
+    sccp_impl(root_op, ctx, Some(observer))
+}
+
+fn sccp_impl(
+    root_op: Ptr<Operation>,
+    ctx: &mut Context,
+    observer: Option<Box<dyn RewriteObserver>>,
+) -> Result<IRStatus> {
     let mut state = SccpState::new(root_op, ctx);
 
     while !state.are_worklists_empty() {
@@ -231,6 +250,7 @@ pub fn sccp(root_op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
     );
 
     let mut rewriter = IRRewriter::<Recorder>::default();
+    rewriter.set_observer(observer);
     let mut status = IRStatus::Unchanged;
     for (op, attrs) in fold_candidates {
         let log_message = if log::log_enabled!(log::Level::Debug) {

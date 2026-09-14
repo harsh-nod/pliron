@@ -32,6 +32,7 @@ use crate::{
     location::{Located, Location},
     op::{Op, OpObj},
     operation::Operation,
+    opts::dce::BlockArgRemoval,
     parsable::{Parsable, ParseResult, StateStream},
     printable::{self, Printable, indented_nl},
     region::Region,
@@ -161,6 +162,16 @@ impl ModuleOp {
     attributes = (func_type : TypeAttr),
 )]
 pub struct FuncOp;
+
+#[op_interface_impl]
+impl BlockArgRemoval for FuncOp {
+    fn can_remove_block_args(&self, ctx: &Context, block: Ptr<BasicBlock>) -> bool {
+        // Entry arguments are the function ABI. Internal block arguments are
+        // maintained together with every incoming branch operand by DCE.
+        block.deref(ctx).get_parent_op(ctx) == Some(self.get_operation())
+            && self.get_region(ctx).deref(ctx).get_head() != Some(block)
+    }
+}
 
 impl FuncOp {
     /// Create a new [FuncOp].

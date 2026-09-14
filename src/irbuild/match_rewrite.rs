@@ -4,7 +4,7 @@
 //! Utilites for matching operations and rewriting them.
 //! Similar in spirit to MLIR's pattern matching rewrites.
 
-use alloc::collections::VecDeque;
+use alloc::{boxed::Box, collections::VecDeque};
 
 use crate::{
     context::{Context, Ptr},
@@ -13,6 +13,7 @@ use crate::{
         IRStatus,
         inserter::{Inserter, OpInsertionPoint},
         listener::{Recorder, RecorderEvent},
+        observer::RewriteObserver,
         rewriter::{IRRewriter, Rewriter},
     },
     operation::Operation,
@@ -63,6 +64,27 @@ pub fn apply_match_rewrite<M: MatchRewrite>(
     order: RewriterOrder,
     op: Ptr<Operation>,
 ) -> Result<IRStatus> {
+    apply_match_rewrite_impl(ctx, match_rewrite, order, op, None)
+}
+
+/// Run the same match driver with independent mutation observations.
+pub fn apply_match_rewrite_with_observer<M: MatchRewrite>(
+    ctx: &mut Context,
+    match_rewrite: &mut M,
+    order: RewriterOrder,
+    op: Ptr<Operation>,
+    observer: Box<dyn RewriteObserver>,
+) -> Result<IRStatus> {
+    apply_match_rewrite_impl(ctx, match_rewrite, order, op, Some(observer))
+}
+
+fn apply_match_rewrite_impl<M: MatchRewrite>(
+    ctx: &mut Context,
+    match_rewrite: &mut M,
+    order: RewriterOrder,
+    op: Ptr<Operation>,
+    observer: Option<Box<dyn RewriteObserver>>,
+) -> Result<IRStatus> {
     Operation::try_preflight_tree(op, ctx)?;
     let mut to_rewrite = VecDeque::new();
 
@@ -89,6 +111,7 @@ pub fn apply_match_rewrite<M: MatchRewrite>(
     let mut erased = HSet::<Ptr<Operation>>::default();
     let mut rewriter = MatchRewriter::default();
     rewriter.set_listener(Recorder::default());
+    rewriter.set_observer(observer);
 
     // Rewrite collected and newly added operations that match.
     while !to_rewrite.is_empty() {

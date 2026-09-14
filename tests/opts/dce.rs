@@ -78,6 +78,18 @@ impl SideEffects for MultiResultDefOp {
 )]
 pub struct MultiUseSinkOp;
 
+#[pliron_op(
+    name = "test.builtin_func_return",
+    format = "$0",
+    interfaces = [
+        pliron::builtin::op_interfaces::IsTerminatorInterface,
+        NOpdsInterface<1>,
+        NResultsInterface<0>
+    ],
+    verifier = "succ"
+)]
+pub struct BuiltinFuncReturnOp;
+
 #[pliron::derive::op_interface_impl]
 impl SideEffects for MultiUseSinkOp {
     fn has_side_effects(&self, _ctx: &Context) -> bool {
@@ -98,6 +110,272 @@ fn run_dce_on_text(input: &str) -> Result<(IRStatus, String)> {
     log::trace!("After DCE:\n{}", after);
     verify_operation(op, ctx)?;
     Ok((status, after))
+}
+
+#[test]
+fn builtin_func_dce_preserves_abi_and_live_argument_identities() -> Result<()> {
+    use pliron::{
+        builtin::{
+            op_interfaces::{BranchOpInterface, OneRegionInterface},
+            ops::FuncOp,
+        },
+        linked_list::ContainsLinkedList,
+        op::op_cast,
+    };
+    let input = r#"
+    builtin.func @f: builtin.function <(builtin.integer i1, builtin.integer i64,
+        builtin.integer i64, builtin.integer i64) -> (builtin.integer i64)> {
+      ^entry(cond: builtin.integer i1, a: builtin.integer i64,
+          b: builtin.integer i64, unused: builtin.integer i64):
+        llvm.cond_br if cond ^left() else ^right()
+      ^left():
+        llvm.br ^join(a, unused, b)
+      ^right():
+        llvm.br ^join(b, unused, a)
+      ^join(first: builtin.integer i64, dead: builtin.integer i64, last: builtin.integer i64):
+        sum = llvm.add first, last <{nsw=false,nuw=false}> : builtin.integer i64;
+        test.builtin_func_return sum
+    }
+    "#;
+    let ctx = &mut Context::new();
+    let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect_ok(ctx);
+    verify_operation(op, ctx)?;
+    let function = Operation::get_op_dyn(op, ctx);
+    let function = function.downcast_ref::<FuncOp>().unwrap();
+    let signature = function.get_type(ctx);
+    let blocks = function
+        .get_region(ctx)
+        .deref(ctx)
+        .iter(ctx)
+        .collect::<Vec<_>>();
+    assert_eq!(blocks.len(), 4);
+    let entry_args = blocks[0].deref(ctx).arguments().collect::<Vec<_>>();
+    let join_args = blocks[3].deref(ctx).arguments().collect::<Vec<_>>();
+    assert_eq!(dce(op, ctx)?, IRStatus::Changed);
+    verify_operation(op, ctx)?;
+    assert_eq!(function.get_type(ctx), signature);
+    assert_eq!(
+        blocks[0].deref(ctx).arguments().collect::<Vec<_>>(),
+        entry_args
+    );
+    assert_eq!(
+        blocks[3].deref(ctx).arguments().collect::<Vec<_>>(),
+        [join_args[0], join_args[2]]
+    );
+    assert_eq!(join_args[0].find_index(ctx), 0);
+    assert_eq!(join_args[2].find_index(ctx), 1);
+    for (block, expected) in [
+        (blocks[1], vec![entry_args[1], entry_args[2]]),
+        (blocks[2], vec![entry_args[2], entry_args[1]]),
+    ] {
+        let terminator = block.deref(ctx).get_terminator(ctx).unwrap();
+        let terminator = Operation::get_op_dyn(terminator, ctx);
+        let branch = op_cast::<dyn BranchOpInterface>(&*terminator).unwrap();
+        assert_eq!(branch.successor_operands(ctx, 0), expected);
+    }
+    assert_eq!(dce(op, ctx)?, IRStatus::Unchanged);
+    Ok(())
+}
+
+#[test]
+fn builtin_func_argument_removal_rejects_entry_and_foreign_blocks() {
+    use pliron::builtin::{op_interfaces::OneRegionInterface, ops::FuncOp, types::FunctionType};
+    let ctx = &mut Context::new();
+    let ty = FunctionType::get(ctx, vec![], vec![]);
+    let own = FuncOp::new(ctx, "own".try_into().unwrap(), ty);
+    let foreign = FuncOp::new(ctx, "foreign".try_into().unwrap(), ty);
+    let own_body = BasicBlock::new(ctx, None, vec![]);
+    own_body.insert_at_back(own.get_region(ctx), ctx);
+    let foreign_body = BasicBlock::new(ctx, None, vec![]);
+    foreign_body.insert_at_back(foreign.get_region(ctx), ctx);
+    let detached = BasicBlock::new(ctx, None, vec![]);
+    assert!(own.can_remove_block_args(ctx, own_body));
+    for block in [
+        own.get_entry_block(ctx),
+        foreign.get_entry_block(ctx),
+        foreign_body,
+        detached,
+    ] {
+        assert!(!own.can_remove_block_args(ctx, block));
+    }
+}
+
+#[test]
+fn builtin_func_dce_cascading_duplicate_edges_erase_each_argument_once() -> Result<()> {
+    use pliron::{
+        builtin::{
+            op_interfaces::{BranchOpInterface, OneRegionInterface},
+            ops::FuncOp,
+        },
+        linked_list::ContainsLinkedList,
+        op::op_cast,
+    };
+
+    let input = r#"
+    builtin.func @f: builtin.function <(builtin.integer i1, builtin.integer i64)
+        -> (builtin.integer i64)> {
+      ^entry(cond: builtin.integer i1, keep: builtin.integer i64):
+        llvm.br ^forward(keep)
+      ^forward(x: builtin.integer i64):
+        llvm.cond_br if cond ^join(x) else ^join(x)
+      ^join(dead: builtin.integer i64):
+        test.builtin_func_return keep
+    }
+    "#;
+    let ctx = &mut Context::new();
+    let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect_ok(ctx);
+    verify_operation(op, ctx)?;
+    let function = Operation::get_op_dyn(op, ctx);
+    let function = function.downcast_ref::<FuncOp>().unwrap();
+    let signature = function.get_type(ctx);
+    let blocks = function
+        .get_region(ctx)
+        .deref(ctx)
+        .iter(ctx)
+        .collect::<Vec<_>>();
+    assert_eq!(blocks.len(), 3);
+    let entry_args = blocks[0].deref(ctx).arguments().collect::<Vec<_>>();
+    let forwarded = blocks[1].deref(ctx).get_argument(0);
+    let dead = blocks[2].deref(ctx).get_argument(0);
+    assert_eq!(forwarded.num_uses(ctx), 2);
+    assert_eq!(blocks[2].num_preds(ctx), 2);
+
+    // Removing join.dead removes both uses of x before processing either
+    // returned operand. The same newly-dead non-entry Value is queued twice.
+    assert_eq!(dce(op, ctx)?, IRStatus::Changed);
+    verify_operation(op, ctx)?;
+    assert_eq!(function.get_type(ctx), signature);
+    assert_eq!(
+        blocks[0].deref(ctx).arguments().collect::<Vec<_>>(),
+        entry_args
+    );
+    assert_eq!(
+        function
+            .get_region(ctx)
+            .deref(ctx)
+            .iter(ctx)
+            .collect::<Vec<_>>(),
+        blocks
+    );
+    assert_eq!(blocks[1].deref(ctx).get_num_arguments(), 0);
+    assert_eq!(blocks[2].deref(ctx).get_num_arguments(), 0);
+    assert!(forwarded.try_find_index(ctx).is_err());
+    assert!(dead.try_find_index(ctx).is_err());
+    for block in &blocks {
+        assert_eq!(block.deref(ctx).iter(ctx).count(), 1);
+    }
+    let entry_branch = blocks[0].deref(ctx).get_terminator(ctx).unwrap();
+    let entry_branch = Operation::get_op_dyn(entry_branch, ctx);
+    let entry_branch = op_cast::<dyn BranchOpInterface>(&*entry_branch).unwrap();
+    assert!(entry_branch.successor_operands(ctx, 0).is_empty());
+    let conditional = blocks[1].deref(ctx).get_terminator(ctx).unwrap();
+    assert_eq!(
+        conditional.deref(ctx).successors().collect::<Vec<_>>(),
+        [blocks[2], blocks[2]]
+    );
+    assert_eq!(
+        conditional.deref(ctx).operands().collect::<Vec<_>>(),
+        [entry_args[0]]
+    );
+    let conditional = Operation::get_op_dyn(conditional, ctx);
+    let conditional = op_cast::<dyn BranchOpInterface>(&*conditional).unwrap();
+    assert!(conditional.successor_operands(ctx, 0).is_empty());
+    assert!(conditional.successor_operands(ctx, 1).is_empty());
+    let returned = blocks[2].deref(ctx).get_terminator(ctx).unwrap();
+    assert_eq!(
+        returned.deref(ctx).operands().collect::<Vec<_>>(),
+        [entry_args[1]]
+    );
+
+    let after = Operation::get_op_dyn(op, ctx).disp(ctx).to_string();
+    assert_eq!(dce(op, ctx)?, IRStatus::Unchanged);
+    verify_operation(op, ctx)?;
+    assert_eq!(Operation::get_op_dyn(op, ctx).disp(ctx).to_string(), after);
+    Ok(())
+}
+
+#[test]
+fn builtin_func_dce_cascading_repeated_operands_erase_each_argument_once() -> Result<()> {
+    use pliron::{
+        builtin::{
+            op_interfaces::{BranchOpInterface, OneRegionInterface},
+            ops::FuncOp,
+        },
+        linked_list::ContainsLinkedList,
+        op::op_cast,
+    };
+
+    let input = r#"
+    builtin.func @f: builtin.function <(builtin.integer i64, builtin.integer i64)
+        -> (builtin.integer i64)> {
+      ^entry(keep: builtin.integer i64, unused_abi: builtin.integer i64):
+        llvm.br ^forward(keep)
+      ^forward(x: builtin.integer i64):
+        unused_sum = llvm.add x, x <{nsw=false,nuw=false}> : builtin.integer i64;
+        test.builtin_func_return keep
+    }
+    "#;
+    let ctx = &mut Context::new();
+    let op = parse_from_str(spaced(Operation::top_level_parser()), ctx, input).expect_ok(ctx);
+    verify_operation(op, ctx)?;
+    let function = Operation::get_op_dyn(op, ctx);
+    let function = function.downcast_ref::<FuncOp>().unwrap();
+    let signature = function.get_type(ctx);
+    let blocks = function
+        .get_region(ctx)
+        .deref(ctx)
+        .iter(ctx)
+        .collect::<Vec<_>>();
+    assert_eq!(blocks.len(), 2);
+    let entry_args = blocks[0].deref(ctx).arguments().collect::<Vec<_>>();
+    assert_eq!(entry_args.len(), 2);
+    let forwarded = blocks[1].deref(ctx).get_argument(0);
+    let unused_sum = blocks[1].deref(ctx).get_head().unwrap();
+    assert_eq!(
+        unused_sum.deref(ctx).operands().collect::<Vec<_>>(),
+        [forwarded, forwarded]
+    );
+    let returned = blocks[1].deref(ctx).get_terminator(ctx).unwrap();
+
+    // LLVM add is actually side-effect-free here. Both equal ordinary operands
+    // cause the newly-unused block argument to be scheduled before either copy
+    // is processed, independently of successor-operand handling.
+    assert_eq!(dce(op, ctx)?, IRStatus::Changed);
+    verify_operation(op, ctx)?;
+    assert_eq!(function.get_type(ctx), signature);
+    assert_eq!(
+        blocks[0].deref(ctx).arguments().collect::<Vec<_>>(),
+        entry_args
+    );
+    assert_eq!(
+        function
+            .get_region(ctx)
+            .deref(ctx)
+            .iter(ctx)
+            .collect::<Vec<_>>(),
+        blocks
+    );
+    assert_eq!(blocks[1].deref(ctx).get_num_arguments(), 0);
+    assert!(forwarded.try_find_index(ctx).is_err());
+    assert_eq!(blocks[0].deref(ctx).iter(ctx).count(), 1);
+    assert_eq!(
+        blocks[1].deref(ctx).iter(ctx).collect::<Vec<_>>(),
+        [returned]
+    );
+    assert_eq!(
+        returned.deref(ctx).operands().collect::<Vec<_>>(),
+        [entry_args[0]]
+    );
+    let entry_branch = blocks[0].deref(ctx).get_terminator(ctx).unwrap();
+    let entry_branch = Operation::get_op_dyn(entry_branch, ctx);
+    let entry_branch = op_cast::<dyn BranchOpInterface>(&*entry_branch).unwrap();
+    assert!(entry_branch.successor_operands(ctx, 0).is_empty());
+
+    let after = Operation::get_op_dyn(op, ctx).disp(ctx).to_string();
+    assert_eq!(dce(op, ctx)?, IRStatus::Unchanged);
+    verify_operation(op, ctx)?;
+    assert_eq!(Operation::get_op_dyn(op, ctx).disp(ctx).to_string(), after);
+    Ok(())
 }
 
 #[test]

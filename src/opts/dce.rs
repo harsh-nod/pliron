@@ -17,7 +17,7 @@
 //! 1. Implements the [BlockArgRemoval] interface, and
 //! 2. Returns `true` for the `can_remove_block_args` method.
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use pliron_derive::op_interface;
 
 use crate::{
@@ -32,6 +32,7 @@ use crate::{
     irbuild::{
         IRStatus,
         listener::{Recorder, RecorderEvent},
+        observer::{RewriteObserver, RewriteOccurrenceEvent},
         rewriter::{IRRewriter, Rewriter},
     },
     op::{Op, op_cast, op_impls},
@@ -190,12 +191,31 @@ fn note_erased_ops(
 /// Perform dead code elimination on the given operation and its nested operations.
 /// See module-level documentation for details on the DCE criteria and interfaces.
 pub fn dce(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
+    dce_impl(op, ctx, None)
+}
+
+/// Run the same pass with independent mutation observations.
+pub fn dce_with_observer(
+    op: Ptr<Operation>,
+    ctx: &mut Context,
+    observer: Box<dyn RewriteObserver>,
+) -> Result<IRStatus> {
+    dce_impl(op, ctx, Some(observer))
+}
+
+fn dce_impl(
+    op: Ptr<Operation>,
+    ctx: &mut Context,
+    observer: Option<Box<dyn RewriteObserver>>,
+) -> Result<IRStatus> {
     Operation::try_preflight_tree(op, ctx)?;
     let mut rewriter = IRRewriter::<Recorder>::default();
+    rewriter.set_observer(observer);
 
     let mut cemetery: Vec<DCECandidate> = Vec::new();
     let mut erased_blocks: HSet<Ptr<BasicBlock>> = HSet::default();
     let mut erased_ops: HSet<Ptr<Operation>> = HSet::default();
+    let mut erased_block_args: HSet<Value> = HSet::default();
 
     // Step 1: Recursively walk the operation tree to collect all dead operations
     walk_op(
@@ -230,12 +250,26 @@ pub fn dce(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
     while let Some(dead) = cemetery.pop() {
         let operands_of_dead = match dead {
             DCECandidate::BlockArg(arg) => {
+                // Repeated dead operands can enqueue the same stable Value.
+                // Skip only arguments this pass has already removed.
+                if erased_block_args.contains(&arg) {
+                    continue;
+                }
                 let block = arg.defining_block().expect("Expected a block argument");
                 if erased_blocks.contains(&block) {
                     // If the block is already erased, skip processing this block argument
                     continue;
                 }
                 let opd_idx = arg.find_index(ctx);
+                if rewriter.observes_occurrences() {
+                    rewriter.notify_occurrence(
+                        ctx,
+                        RewriteOccurrenceEvent::BlockArgumentErasing {
+                            block,
+                            argument: arg,
+                        },
+                    );
+                }
                 let successor_operands = block
                     .uses(ctx)
                     .iter()
@@ -254,6 +288,7 @@ pub fn dce(op: Ptr<Operation>, ctx: &mut Context) -> Result<IRStatus> {
                     block.label(ctx)
                 );
                 BasicBlock::remove_argument(block, ctx, opd_idx);
+                erased_block_args.insert(arg);
                 successor_operands
             }
             DCECandidate::Op(dead_op) => {

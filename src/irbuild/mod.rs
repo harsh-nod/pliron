@@ -9,6 +9,7 @@ pub mod equivalence;
 pub mod inserter;
 pub mod listener;
 pub mod match_rewrite;
+pub mod observer;
 pub mod rewriter;
 
 use core::ops::{BitOr, BitOrAssign};

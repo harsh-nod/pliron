@@ -3,7 +3,7 @@
 
 //! [Rewriter] extends [Inserter] with more capabilities, such as replace and erase operations.
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 use crate::{
     basic_block::BasicBlock,
@@ -14,6 +14,7 @@ use crate::{
     irbuild::{
         inserter::{BlockInsertionPoint, IRInserter, Inserter, OpInsertionPoint},
         listener::RewriteListener,
+        observer::{RewriteEvent, RewriteObserver, RewriteOccurrenceEvent},
     },
     linked_list::{ContainsLinkedList, LinkedList},
     location::Located,
@@ -46,6 +47,15 @@ impl Default for RewriterConfig {
 
 /// Rewriter interface for transformations.
 pub trait Rewriter: Inserter {
+    /// Whether an opt-in occurrence observer is attached. This has no side effects.
+    fn observes_occurrences(&self) -> bool {
+        false
+    }
+
+    /// Reports an actual transform boundary, immediately before its mutation.
+    /// Generic transforms must check observes_occurrences before constructing it.
+    fn notify_occurrence(&mut self, _ctx: &Context, _event: RewriteOccurrenceEvent) {}
+
     /// Get the configuration for this rewriter.
     fn get_config(&self) -> &RewriterConfig;
 
@@ -123,6 +133,7 @@ pub trait Rewriter: Inserter {
 pub struct IRRewriter<L: RewriteListener> {
     inserter: IRInserter<L>,
     config: RewriterConfig,
+    observer: Option<Box<dyn RewriteObserver>>,
     _phantom: core::marker::PhantomData<L>,
 }
 
@@ -134,12 +145,24 @@ where
         Self {
             inserter: IRInserter::default(),
             config: RewriterConfig::default(),
+            observer: None,
             _phantom: core::marker::PhantomData,
         }
     }
 }
 
 impl<L: RewriteListener> IRRewriter<L> {
+    /// Set an independent, opt-in mutation observer.
+    pub fn set_observer(&mut self, observer: Option<Box<dyn RewriteObserver>>) {
+        self.observer = observer;
+    }
+
+    fn observe(&mut self, ctx: &Context, event: RewriteEvent) {
+        if let Some(observer) = &mut self.observer {
+            observer.observe(ctx, event);
+        }
+    }
+
     /// Sets the listener for insertion events.
     pub fn set_listener(&mut self, listener: L) {
         self.inserter.set_listener(listener);
@@ -158,19 +181,21 @@ impl<L: RewriteListener> IRRewriter<L> {
 
 impl<L: RewriteListener> Inserter for IRRewriter<L> {
     fn append_operation(&mut self, ctx: &Context, operation: Ptr<Operation>) {
-        self.inserter.append_operation(ctx, operation)
+        self.inserter.append_operation(ctx, operation);
+        self.observe(ctx, RewriteEvent::OperationInserted(operation));
     }
 
     fn append_op(&mut self, ctx: &Context, op: &dyn Op) {
-        self.inserter.append_op(ctx, op)
+        self.append_operation(ctx, op.get_operation());
     }
 
     fn insert_operation(&mut self, ctx: &Context, operation: Ptr<Operation>) {
-        self.inserter.insert_operation(ctx, operation)
+        self.inserter.insert_operation(ctx, operation);
+        self.observe(ctx, RewriteEvent::OperationInserted(operation));
     }
 
     fn insert_op(&mut self, ctx: &Context, op: &dyn Op) {
-        self.inserter.insert_op(ctx, op)
+        self.insert_operation(ctx, op.get_operation());
     }
 
     fn insert_block(
@@ -179,7 +204,8 @@ impl<L: RewriteListener> Inserter for IRRewriter<L> {
         insertion_point: BlockInsertionPoint,
         block: Ptr<BasicBlock>,
     ) {
-        self.inserter.insert_block(ctx, insertion_point, block)
+        self.inserter.insert_block(ctx, insertion_point, block);
+        self.observe(ctx, RewriteEvent::BlockInserted(block));
     }
 
     fn create_block(
@@ -189,8 +215,11 @@ impl<L: RewriteListener> Inserter for IRRewriter<L> {
         label: Option<Identifier>,
         arg_types: Vec<TypeHandle>,
     ) -> Ptr<BasicBlock> {
-        self.inserter
-            .create_block(ctx, insertion_point, label, arg_types)
+        let block = self
+            .inserter
+            .create_block(ctx, insertion_point, label, arg_types);
+        self.observe(ctx, RewriteEvent::BlockInserted(block));
+        block
     }
 
     fn get_insertion_point(&self) -> OpInsertionPoint {
@@ -207,6 +236,20 @@ impl<L: RewriteListener> Inserter for IRRewriter<L> {
 }
 
 impl<L: RewriteListener> Rewriter for IRRewriter<L> {
+    fn observes_occurrences(&self) -> bool {
+        self.observer
+            .as_ref()
+            .is_some_and(|observer| observer.observes_occurrences())
+    }
+
+    fn notify_occurrence(&mut self, ctx: &Context, event: RewriteOccurrenceEvent) {
+        if let Some(observer) = &mut self.observer
+            && observer.observes_occurrences()
+        {
+            observer.observe_occurrence(ctx, event);
+        }
+    }
+
     fn get_config(&self) -> &RewriterConfig {
         &self.config
     }
@@ -224,6 +267,13 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         {
             new_op.deref_mut(ctx).set_loc(op.deref(ctx).loc());
         }
+        self.observe(
+            ctx,
+            RewriteEvent::OperationReplaced {
+                old: op,
+                new: new_op,
+            },
+        );
         let new_values = new_op.deref(ctx).results().collect();
         self.replace_operation_with_values(ctx, op, new_values);
     }
@@ -240,6 +290,13 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         // We need to collect the results first to avoid `RefCell` borrowing issues.
         let results: Vec<_> = op.deref(ctx).results().zip(new_values).collect();
         for (res, new_res) in results {
+            self.observe(
+                ctx,
+                RewriteEvent::ValueReplaced {
+                    old: res,
+                    new: new_res,
+                },
+            );
             self.get_listener_mut()
                 .notify_value_use_replacement(ctx, res, new_res);
             res.replace_all_uses_with(ctx, &new_res);
@@ -259,6 +316,13 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         if old_value == new_value {
             return;
         }
+        self.observe(
+            ctx,
+            RewriteEvent::ValueReplaced {
+                old: old_value,
+                new: new_value,
+            },
+        );
         self.get_listener_mut()
             .notify_value_use_replacement(ctx, old_value, new_value);
         old_value.replace_all_uses_with(ctx, &new_value);
@@ -278,6 +342,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
             self.erase_region(ctx, region);
         }
 
+        self.observe(ctx, RewriteEvent::OperationErased(op));
         self.get_listener_mut().notify_operation_erasure(ctx, op);
 
         Operation::erase(op, ctx);
@@ -295,6 +360,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
             self.erase_operation(ctx, op);
         }
 
+        self.observe(ctx, RewriteEvent::BlockErased(block));
         self.get_listener_mut().notify_block_erasure(ctx, block);
 
         BasicBlock::erase(block, ctx);
@@ -324,6 +390,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
             self.erase_block(ctx, block);
         }
 
+        self.observe(ctx, RewriteEvent::RegionErased(region));
         self.get_listener_mut().notify_region_erasure(ctx, region);
 
         let index_in_parent = region.deref(ctx).find_index_in_parent(ctx);
@@ -334,6 +401,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
 
     fn unlink_operation(&mut self, ctx: &Context, op: Ptr<Operation>) {
         Operation::try_preflight_tree(op, ctx).expect("Operation unlink preflight failed");
+        self.observe(ctx, RewriteEvent::OperationUnlinked(op));
         self.get_listener_mut().notify_operation_unlinking(ctx, op);
         op.unlink(ctx);
         self.mark_modified();
@@ -341,6 +409,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
 
     fn unlink_block(&mut self, ctx: &Context, block: Ptr<BasicBlock>) {
         Operation::try_preflight_block_tree(block, ctx).expect("Block unlink preflight failed");
+        self.observe(ctx, RewriteEvent::BlockUnlinked(block));
         self.get_listener_mut().notify_block_unlinking(ctx, block);
         block.unlink(ctx);
         self.mark_modified();
@@ -478,6 +547,14 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         if old_type == new_type {
             return;
         }
+        self.observe(
+            ctx,
+            RewriteEvent::ValueTypeChanged {
+                value,
+                old_type,
+                new_type,
+            },
+        );
         self.get_listener_mut()
             .notify_value_type_change(ctx, value, old_type, new_type);
         value.set_type(ctx, new_type);
@@ -591,6 +668,14 @@ impl<'a> Inserter for ScopedRewriter<'a> {
 }
 
 impl<'a> Rewriter for ScopedRewriter<'a> {
+    fn observes_occurrences(&self) -> bool {
+        self.rewriter.observes_occurrences()
+    }
+
+    fn notify_occurrence(&mut self, ctx: &Context, event: RewriteOccurrenceEvent) {
+        self.rewriter.notify_occurrence(ctx, event);
+    }
+
     fn get_config(&self) -> &RewriterConfig {
         self.rewriter.get_config()
     }
