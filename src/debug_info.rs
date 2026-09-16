@@ -166,6 +166,35 @@ fn get_name_from_attr_map(attributes: &AttributeDict, idx: usize) -> Option<Iden
         .and_then(|debug_info| debug_info.get_name(idx))
 }
 
+fn get_name_byte_len_from_attr_map(attributes: &AttributeDict, idx: usize) -> Option<usize> {
+    // Scan borrowed keys without initializing the owned lazy key or changing
+    // Identifier's map-lookup inference through another Borrow implementation.
+    attributes
+        .0
+        .iter()
+        .find(|(key, _)| key.as_ref() == "builtin_debug_info")
+        .and_then(|(_, attribute)| attribute.downcast_ref::<DebugInfoAttr>())
+        .and_then(|debug_info| debug_info.names.get(idx))
+        .and_then(Option::as_ref)
+        .map(|name| name.as_ref().len())
+}
+
+pub(crate) fn get_operation_result_name_byte_len(
+    ctx: &Context,
+    op: Ptr<Operation>,
+    res_idx: usize,
+) -> Option<usize> {
+    get_name_byte_len_from_attr_map(&op.deref(ctx).attributes, res_idx)
+}
+
+pub(crate) fn get_block_arg_name_byte_len(
+    ctx: &Context,
+    block: Ptr<BasicBlock>,
+    arg_idx: usize,
+) -> Option<usize> {
+    get_name_byte_len_from_attr_map(&block.deref(ctx).attributes, arg_idx)
+}
+
 /// Set the name for a result in an [Operation].
 /// Panics if the given `res_idx` is out of range.
 pub fn set_operation_result_name(
@@ -339,6 +368,131 @@ mod tests {
                     0,
                 ),
             }
+        }
+    }
+
+    fn assert_exact_name_length(ctx: &Context, value: crate::value::Value) {
+        use crate::common_traits::Named;
+        let expected = value.unique_name(ctx).as_ref().len();
+        let epoch = ctx.ir_mutation_attempt_epoch().unwrap();
+        for _ in 0..3 {
+            assert_eq!(value.unique_name_byte_len(ctx), Some(expected));
+            assert_eq!(ctx.ir_mutation_attempt_epoch().unwrap(), epoch);
+        }
+    }
+
+    #[test]
+    fn unique_name_length_tracks_live_result_and_argument_names() {
+        let mut ctx = Context::new();
+        let ty = IntegerType::get(&ctx, 64, Signedness::Signed);
+        let op = Operation::new(
+            &mut ctx,
+            ZeroOp::get_concrete_op_info(),
+            vec![ty.into(), ty.into(), ty.into()],
+            vec![],
+            vec![],
+            0,
+        );
+        let block = BasicBlock::new(&mut ctx, None, vec![ty.into(), ty.into(), ty.into()]);
+        for index in 0..3 {
+            let result = op.deref(&ctx).get_result(index);
+            let argument = block.deref(&ctx).get_argument(index);
+            assert_exact_name_length(&ctx, result);
+            assert_exact_name_length(&ctx, argument);
+            set_operation_result_name(&ctx, op, index, Some("result_name".try_into().unwrap()));
+            set_block_arg_name(
+                &ctx,
+                block,
+                index,
+                Some("argument_name".try_into().unwrap()),
+            );
+            assert_exact_name_length(&ctx, result);
+            assert_exact_name_length(&ctx, argument);
+            set_operation_result_name(&ctx, op, index, Some("renamed".try_into().unwrap()));
+            set_block_arg_name(&ctx, block, index, None);
+            assert_exact_name_length(&ctx, result);
+            assert_exact_name_length(&ctx, argument);
+        }
+    }
+
+    #[test]
+    fn unique_name_length_handles_long_names_and_shifted_live_values() {
+        use crate::builtin::attributes::StringAttr;
+        let mut ctx = Context::new();
+        let ty = IntegerType::get(&ctx, 64, Signedness::Signed);
+        let op = ZeroOp::new(&mut ctx).get_operation();
+        let block = BasicBlock::new(&mut ctx, None, vec![ty.into()]);
+        let result = op.deref(&ctx).get_result(0);
+        let argument = block.deref(&ctx).get_argument(0);
+        let long = "x".repeat(8_192);
+        set_operation_result_name(&ctx, op, 0, Some(long.as_str().try_into().unwrap()));
+        set_block_arg_name(&ctx, block, 0, Some(long.as_str().try_into().unwrap()));
+        op.deref_mut(&ctx)
+            .attributes
+            .set("other".try_into().unwrap(), StringAttr::new("value".into()));
+        block
+            .deref_mut(&ctx)
+            .attributes
+            .set("other".try_into().unwrap(), StringAttr::new("value".into()));
+        assert!(!op.deref(&ctx).attributes.0.is_inline());
+        assert!(!block.deref(&ctx).attributes.0.is_inline());
+        assert_exact_name_length(&ctx, result);
+        assert_exact_name_length(&ctx, argument);
+        Operation::insert_result(op, &ctx, 0, ty.into());
+        BasicBlock::insert_argument(block, &ctx, 0, ty.into());
+        assert_eq!(result.find_index(&ctx), 1);
+        assert_eq!(argument.find_index(&ctx), 1);
+        assert_exact_name_length(&ctx, result);
+        assert_exact_name_length(&ctx, argument);
+        Operation::remove_result(op, &ctx, 0);
+        BasicBlock::remove_argument(block, &ctx, 0);
+        assert_eq!(result.find_index(&ctx), 0);
+        assert_eq!(argument.find_index(&ctx), 0);
+        assert_exact_name_length(&ctx, result);
+        assert_exact_name_length(&ctx, argument);
+    }
+
+    #[test]
+    fn borrowed_debug_length_matches_optional_and_malformed_lookup_behavior() {
+        use super::{DebugInfoAttr, get_name_byte_len_from_attr_map, get_name_from_attr_map};
+        use crate::{attribute::AttributeDict, builtin::attributes::StringAttr};
+        let mut attributes = AttributeDict::default();
+        assert_eq!(get_name_byte_len_from_attr_map(&attributes, 0), None);
+        attributes.set(
+            "wrong_key".try_into().unwrap(),
+            DebugInfoAttr {
+                names: vec![Some("ignored".try_into().unwrap())],
+            },
+        );
+        assert_eq!(get_name_byte_len_from_attr_map(&attributes, 0), None);
+        attributes.set(
+            "builtin_debug_info".try_into().unwrap(),
+            StringAttr::new("wrong type".into()),
+        );
+        assert_eq!(get_name_byte_len_from_attr_map(&attributes, 0), None);
+        assert_eq!(get_name_from_attr_map(&attributes, 0), None);
+        attributes = AttributeDict::default();
+        attributes.set(
+            "builtin_debug_info".try_into().unwrap(),
+            DebugInfoAttr {
+                names: vec![Some("named".try_into().unwrap()), None],
+            },
+        );
+        for spilled in [false, true] {
+            if spilled {
+                attributes.set("other".try_into().unwrap(), StringAttr::new("value".into()));
+            }
+            assert_eq!(attributes.0.is_inline(), !spilled);
+            let original = attributes.clone();
+            for index in 0..3 {
+                let expected =
+                    get_name_from_attr_map(&attributes, index).map(|name| name.as_ref().len());
+                assert_eq!(
+                    get_name_byte_len_from_attr_map(&attributes, index),
+                    expected
+                );
+            }
+            assert_eq!(attributes, original);
         }
     }
 

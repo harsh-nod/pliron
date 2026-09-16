@@ -176,6 +176,30 @@ pub enum ValueError {
 }
 
 impl Value {
+    /// Exact byte length of this value's [unique name](Named::unique_name).
+    ///
+    /// For a live value, this reads borrowed debug metadata without allocating
+    /// or formatting a name. It searches the defining entity for the value's
+    /// result or argument index and scans its debug-attribute dictionary; work
+    /// is linear in that arity plus the dictionary's entry count.
+    /// Returns `None` if the name length cannot be represented as `usize`.
+    ///
+    /// # Panics
+    /// Panics under the same invalid-value conditions as [Value::find_index].
+    /// Invalid-value diagnostics are not guaranteed to be allocation-free.
+    pub fn unique_name_byte_len(&self, ctx: &Context) -> Option<usize> {
+        let index = self.find_index(ctx);
+        let given_name_bytes = match self.defining_entity {
+            DefiningEntity::Op(op) => {
+                debug_info::get_operation_result_name_byte_len(ctx, op, index)
+            }
+            DefiningEntity::Block(block) => {
+                debug_info::get_block_arg_name_byte_len(ctx, block, index)
+            }
+        };
+        unique_value_name_byte_len(self.val_uid, given_name_bytes)
+    }
+
     /// Get the defining entity
     pub fn defining_entity(&self) -> DefiningEntity {
         self.defining_entity
@@ -345,6 +369,19 @@ impl Typed for Value {
             DefiningEntity::Op(op) => op.deref(ctx).results[index].get_type(),
             DefiningEntity::Block(block) => block.deref(ctx).args[index].get_type(),
         }
+    }
+}
+
+fn unique_value_name_byte_len(mut uid: u64, given_name_bytes: Option<usize>) -> Option<usize> {
+    // The ID spelling is `v` followed by the full decimal u64 UID.
+    let mut id_bytes = 2_usize;
+    while uid >= 10 {
+        id_bytes += 1;
+        uid /= 10;
+    }
+    match given_name_bytes {
+        Some(bytes) => bytes.checked_add(1)?.checked_add(id_bytes),
+        None => Some(id_bytes),
     }
 }
 
@@ -650,5 +687,58 @@ impl<T: UseTrait> Use<T> {
 impl Typed for Use<Value> {
     fn get_type(&self, ctx: &Context) -> TypeHandle {
         self.get_def(ctx).get_type(ctx)
+    }
+}
+
+#[cfg(test)]
+mod unique_name_byte_len_tests {
+    use super::unique_value_name_byte_len;
+    use alloc::format;
+
+    #[test]
+    fn exact_uid_digit_boundaries_and_full_u64_range() {
+        let check = |uid| {
+            let expected = format!("v{uid}").len();
+            assert_eq!(unique_value_name_byte_len(uid, None), Some(expected));
+            assert_eq!(unique_value_name_byte_len(uid, Some(7)), Some(8 + expected));
+        };
+        check(0);
+        let mut power = 1_u64;
+        loop {
+            check(power - 1);
+            check(power);
+            check(power + 1);
+            let Some(next) = power.checked_mul(10) else {
+                break;
+            };
+            power = next;
+        }
+        check(u64::MAX);
+        assert_eq!(unique_value_name_byte_len(u64::MAX, None), Some(21));
+    }
+
+    #[test]
+    fn name_length_arithmetic_is_checked_without_a_name_ceiling() {
+        for bytes in [0, 1, 8_192, 1_048_576] {
+            assert_eq!(unique_value_name_byte_len(0, Some(bytes)), Some(bytes + 3));
+            assert_eq!(
+                unique_value_name_byte_len(u64::MAX, Some(bytes)),
+                Some(bytes + 22)
+            );
+        }
+        assert_eq!(
+            unique_value_name_byte_len(0, Some(usize::MAX - 3)),
+            Some(usize::MAX)
+        );
+        assert_eq!(unique_value_name_byte_len(0, Some(usize::MAX - 2)), None);
+        assert_eq!(
+            unique_value_name_byte_len(u64::MAX, Some(usize::MAX - 22)),
+            Some(usize::MAX)
+        );
+        assert_eq!(
+            unique_value_name_byte_len(u64::MAX, Some(usize::MAX - 21)),
+            None
+        );
+        assert_eq!(unique_value_name_byte_len(0, Some(usize::MAX)), None);
     }
 }
