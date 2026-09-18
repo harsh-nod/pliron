@@ -5,7 +5,7 @@ use alloc::{vec, vec::Vec};
 
 use crate::{
     basic_block::BasicBlock,
-    context::{Context, Ptr},
+    context::{Context, ContextIdentity, IrMutationAttemptEpoch, Ptr},
     graph::{
         ControlFlowGraph, find_ancestor_block_of_block_in_region, find_ancestor_op_of_op_in_region,
         strictly_precedes_in_block, traversals,
@@ -323,11 +323,65 @@ fn try_get_blocks_in_same_region(
     None
 }
 
-/// Caches dominance trees for multiple regions in a program
+/// An immutable verification interval, invalidated by every IR mutation attempt.
+struct VerificationEpoch {
+    owner: ContextIdentity,
+    epoch: IrMutationAttemptEpoch,
+}
+
+/// Caches dominance trees for multiple regions in a program.
 #[derive(Default)]
-pub struct DomInfo(HMap<Ptr<Region>, DomTree<Ptr<Region>, Context>>);
+pub struct DomInfo(
+    HMap<Ptr<Region>, DomTree<Ptr<Region>, Context>>,
+    Option<VerificationEpoch>,
+    #[cfg(test)] usize,
+);
 
 impl DomInfo {
+    /// Only the complete dominance-verifier traversal uses this interval. A shared
+    /// Context alone is not immutable: arena RefCells permit mutation through it.
+    pub(crate) fn for_verification(ctx: &Context) -> Self {
+        Self {
+            1: Some(VerificationEpoch {
+                owner: ctx.identity(),
+                epoch: ctx
+                    .ir_mutation_attempt_epoch()
+                    .expect("Dominance verification epoch exhausted"),
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn require_verification_epoch(&self, ctx: &Context) {
+        if let Some(scope) = &self.1 {
+            assert_eq!(
+                scope.owner,
+                ctx.identity(),
+                "Dominance verification context changed"
+            );
+            assert_eq!(
+                scope.epoch,
+                ctx.ir_mutation_attempt_epoch()
+                    .expect("Dominance verification epoch exhausted"),
+                "IR mutation attempted during dominance verification"
+            );
+        }
+    }
+
+    fn preflight_region(&mut self, ctx: &Context, region: Ptr<Region>) {
+        #[cfg(test)]
+        {
+            self.2 += 1;
+        }
+        Operation::try_preflight_region_tree(region, ctx)
+            .expect("Dominator-tree region preflight failed");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verification_preflight_count(&self) -> usize {
+        self.2
+    }
+
     /// If dominator tree for `region` is cached, return it.
     /// Otherwise, computes, caches, and returns the `region`'s dominator tree.
     pub fn get_dom_tree(
@@ -335,11 +389,30 @@ impl DomInfo {
         ctx: &Context,
         region: Ptr<Region>,
     ) -> &DomTree<Ptr<Region>, Context> {
-        Operation::try_preflight_region_tree(region, ctx)
-            .expect("Dominator-tree region preflight failed");
-        self.0
-            .entry(region)
-            .or_insert_with(|| compute_dominator_tree(ctx, &region))
+        if self.1.is_none() {
+            // Preserve the public cache's preflight behavior and error order.
+            self.preflight_region(ctx, region);
+            return self
+                .0
+                .entry(region)
+                .or_insert_with(|| compute_dominator_tree(ctx, &region));
+        }
+
+        self.require_verification_epoch(ctx);
+        // Authenticate the owner and live arena generation even on a cache hit.
+        drop(
+            region
+                .try_deref(ctx)
+                .expect("Dominator-tree region owner/liveness check failed"),
+        );
+        if !self.0.contains_key(&region) {
+            self.preflight_region(ctx, region);
+            self.require_verification_epoch(ctx);
+            let tree = compute_dominator_tree(ctx, &region);
+            self.require_verification_epoch(ctx);
+            self.0.insert(region, tree);
+        }
+        self.0.get(&region).expect("Dominance tree was inserted")
     }
 
     /// Does block `a` strictly dominate block `b`?
@@ -360,22 +433,27 @@ impl DomInfo {
         a: Ptr<BasicBlock>,
         b: Ptr<BasicBlock>,
     ) -> bool {
-        let region_a = a
-            .deref(ctx)
-            .get_parent_region()
-            .expect("A block must be in a region");
-        let region_a_ssa = region_a.deref(ctx).has_ssa_dominance(ctx);
+        self.require_verification_epoch(ctx);
+        let result = 'query: {
+            let region_a = a
+                .deref(ctx)
+                .get_parent_region()
+                .expect("A block must be in a region");
+            let region_a_ssa = region_a.deref(ctx).has_ssa_dominance(ctx);
 
-        let Some(b) = find_ancestor_block_of_block_in_region(ctx, b, region_a) else {
-            return false;
+            let Some(b) = find_ancestor_block_of_block_in_region(ctx, b, region_a) else {
+                break 'query false;
+            };
+
+            if a == b {
+                break 'query !region_a_ssa;
+            }
+
+            let dom_tree = self.get_dom_tree(ctx, region_a);
+            dom_tree.dominates(&a, &b)
         };
-
-        if a == b {
-            return !region_a_ssa;
-        }
-
-        let dom_tree = self.get_dom_tree(ctx, region_a);
-        dom_tree.dominates(&a, &b)
+        self.require_verification_epoch(ctx);
+        result
     }
 
     /// Does `a` strictly dominate `b`?
@@ -396,29 +474,34 @@ impl DomInfo {
         a: Ptr<Operation>,
         b: Ptr<Operation>,
     ) -> bool {
-        let Some(block_a) = a.deref(ctx).get_parent_block() else {
-            return false;
+        self.require_verification_epoch(ctx);
+        let result = 'query: {
+            let Some(block_a) = a.deref(ctx).get_parent_block() else {
+                break 'query false;
+            };
+            let region_a = block_a
+                .deref(ctx)
+                .get_parent_region()
+                .expect("A block must be in a region");
+            let region_a_ssa = region_a.deref(ctx).has_ssa_dominance(ctx);
+
+            let Some(b) = find_ancestor_op_of_op_in_region(ctx, b, region_a) else {
+                break 'query false;
+            };
+            let block_b = b
+                .deref(ctx)
+                .get_parent_block()
+                .expect("B block must be in a region");
+
+            if block_a == block_b {
+                break 'query !region_a_ssa || strictly_precedes_in_block(ctx, a, b);
+            }
+
+            let dom_tree = self.get_dom_tree(ctx, region_a);
+            dom_tree.dominates(&block_a, &block_b)
         };
-        let region_a = block_a
-            .deref(ctx)
-            .get_parent_region()
-            .expect("A block must be in a region");
-        let region_a_ssa = region_a.deref(ctx).has_ssa_dominance(ctx);
-
-        let Some(b) = find_ancestor_op_of_op_in_region(ctx, b, region_a) else {
-            return false;
-        };
-        let block_b = b
-            .deref(ctx)
-            .get_parent_block()
-            .expect("B block must be in a region");
-
-        if block_a == block_b {
-            return !region_a_ssa || strictly_precedes_in_block(ctx, a, b);
-        }
-
-        let dom_tree = self.get_dom_tree(ctx, region_a);
-        dom_tree.dominates(&block_a, &block_b)
+        self.require_verification_epoch(ctx);
+        result
     }
 
     /// Does value `a` strictly dominate operation `b`?
@@ -435,7 +518,8 @@ impl DomInfo {
         a: Value,
         b: Ptr<Operation>,
     ) -> bool {
-        match a.defining_entity() {
+        self.require_verification_epoch(ctx);
+        let result = match a.defining_entity() {
             DefiningEntity::Op(op) => self.op_strictly_dominates_op(ctx, op, b),
             DefiningEntity::Block(a_block) => {
                 if let Some(b_parent_block) = b.deref(ctx).get_parent_block() {
@@ -453,7 +537,9 @@ impl DomInfo {
                     false
                 }
             }
-        }
+        };
+        self.require_verification_epoch(ctx);
+        result
     }
 
     /// Find the nearest common dominator of `a` and `b`, if it exists.
@@ -467,22 +553,39 @@ impl DomInfo {
         a: Ptr<BasicBlock>,
         b: Ptr<BasicBlock>,
     ) -> Option<Ptr<BasicBlock>> {
-        if a == b {
-            return Some(a);
+        self.require_verification_epoch(ctx);
+        if self.1.is_some() {
+            drop(
+                a.try_deref(ctx)
+                    .expect("Dominance block owner/liveness check failed"),
+            );
+            drop(
+                b.try_deref(ctx)
+                    .expect("Dominance block owner/liveness check failed"),
+            );
         }
+        let result = 'query: {
+            if a == b {
+                break 'query Some(a);
+            }
 
-        let (a, b) = try_get_blocks_in_same_region(ctx, a, b)?;
+            let Some((a, b)) = try_get_blocks_in_same_region(ctx, a, b) else {
+                break 'query None;
+            };
 
-        if a == b {
-            return Some(a);
-        }
+            if a == b {
+                break 'query Some(a);
+            }
 
-        let region = a
-            .deref(ctx)
-            .get_parent_region()
-            .expect("A block must be in a region");
-        let dom_tree = self.get_dom_tree(ctx, region);
-        Some(dom_tree.nearest_common_dominator(&a, &b))
+            let region = a
+                .deref(ctx)
+                .get_parent_region()
+                .expect("A block must be in a region");
+            let dom_tree = self.get_dom_tree(ctx, region);
+            Some(dom_tree.nearest_common_dominator(&a, &b))
+        };
+        self.require_verification_epoch(ctx);
+        result
     }
 }
 
@@ -1344,3 +1447,7 @@ mod tests {
         assert_eq!(dom_info.nearest_common_dominator(ctx, b1, b2), None);
     }
 }
+
+#[cfg(test)]
+#[path = "dominance_verification_scope_v1_tests.rs"]
+mod verification_scope_tests;

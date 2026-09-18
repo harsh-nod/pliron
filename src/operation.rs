@@ -1169,7 +1169,16 @@ pub enum DefUseVerifyErr {
 
 /// Verify that every value in the IR dominates all of its uses.
 pub fn verify_value_dominance(ir: Ptr<Operation>, ctx: &Context) -> Result<()> {
-    let dom_info = &mut DomInfo::default();
+    let mut dom_info = DomInfo::for_verification(ctx);
+    verify_value_dominance_with_info(ir, ctx, &mut dom_info)
+}
+
+pub(crate) fn verify_value_dominance_with_info(
+    ir: Ptr<Operation>,
+    ctx: &Context,
+    dom_info: &mut DomInfo,
+) -> Result<()> {
+    dom_info.require_verification_epoch(ctx);
 
     fn check_value_use(
         ctx: &Context,
@@ -1211,17 +1220,18 @@ pub fn verify_value_dominance(ir: Ptr<Operation>, ctx: &Context) -> Result<()> {
             IRNode::Region(_region) => walk_advance(),
         }
     }
-    match walker(
+    let result = match walker(
         ctx,
         dom_info,
         &WALKCONFIG_PREORDER_FORWARD,
         ir,
         walker_callback,
     ) {
-        core::ops::ControlFlow::Continue(_) => {}
-        core::ops::ControlFlow::Break(err) => return Err(err),
-    }
-    Ok(())
+        core::ops::ControlFlow::Continue(_) => Ok(()),
+        core::ops::ControlFlow::Break(err) => Err(err),
+    };
+    dom_info.require_verification_epoch(ctx);
+    result
 }
 
 /// Verify an operation and all its nested regions and blocks.
