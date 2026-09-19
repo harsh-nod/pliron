@@ -186,18 +186,25 @@ fn diamond_loop_duplicate_edges_and_unreachable_queries_match_legacy() {
         );
     }
     assert_eq!(scoped.verification_preflight_count(), 1);
-    // The old algorithm decides unreachable semantics; this optimization does not change them.
+    // Both cache modes must completely verify unreachable users of entry inputs.
     let mut old_walk = DomInfo::default();
     let mut new_walk = DomInfo::for_verification(ctx);
     assert_eq!(
         outcome(
             || verify_value_dominance_with_info(module.get_operation(), ctx, &mut old_walk).is_ok()
         ),
+        Some(true)
+    );
+    assert_eq!(
         outcome(
             || verify_value_dominance_with_info(module.get_operation(), ctx, &mut new_walk).is_ok()
-        )
+        ),
+        Some(true)
     );
 }
+
+#[path = "dominance_unreachable_v1_tests.rs"]
+mod unreachable_tests;
 
 #[test]
 fn nested_regions_do_not_borrow_each_others_preflight() {

@@ -5,11 +5,13 @@ use alloc::{vec, vec::Vec};
 
 use crate::{
     basic_block::BasicBlock,
+    builtin::op_interfaces::IsolatedFromAboveInterface,
     context::{Context, ContextIdentity, IrMutationAttemptEpoch, Ptr},
     graph::{
         ControlFlowGraph, find_ancestor_block_of_block_in_region, find_ancestor_op_of_op_in_region,
         strictly_precedes_in_block, traversals,
     },
+    op::op_impls,
     operation::Operation,
     pass::{Analysis, AnalysisManager},
     region::Region,
@@ -166,13 +168,20 @@ where
     G: ControlFlowGraph<GraphContext>,
 {
     /// Does `dominator` dominate `dominatee`?
+    ///
+    /// Identity remains reflexive. Distinct nodes absent from this entry-reachable
+    /// tree have no proved dominance relation; unreachable nodes are not invented
+    /// as children of the entry node.
     pub fn dominates(&self, dominator: &G::Node, dominatee: &G::Node) -> bool {
         let mut node_opt = Some(dominatee.clone());
         while let Some(node) = node_opt {
             if node == *dominator {
                 return true;
             }
-            node_opt = self.dominators_map[&node].parent.clone();
+            let Some(found) = self.dominators_map.get(&node) else {
+                return false;
+            };
+            node_opt = found.parent.clone();
         }
         false
     }
@@ -327,6 +336,31 @@ fn try_get_blocks_in_same_region(
 struct VerificationEpoch {
     owner: ContextIdentity,
     epoch: IrMutationAttemptEpoch,
+}
+
+/// Only for newly admitted uses of region inputs in unreachable blocks. The
+/// namespace interface is not a general capture verifier; conservatively keep
+/// this extension from crossing one of its boundaries. Existing reachable
+/// dominance/capture behavior is unchanged.
+fn unreachable_entry_input_scope(
+    ctx: &Context,
+    mut user: Ptr<BasicBlock>,
+    defining_region: Ptr<Region>,
+) -> bool {
+    while let Some(region) = user.deref(ctx).get_parent_region() {
+        if region == defining_region {
+            return true;
+        }
+        let parent = region.deref(ctx).get_parent_op();
+        if op_impls::<dyn IsolatedFromAboveInterface>(Operation::get_op_dyn(parent, ctx).as_ref()) {
+            return false;
+        }
+        let Some(block) = parent.deref(ctx).get_parent_block() else {
+            return false;
+        };
+        user = block;
+    }
+    false
 }
 
 /// Caches dominance trees for multiple regions in a program.
@@ -511,7 +545,11 @@ impl DomInfo {
     /// See `op_strictly_dominates_op` for the definition of "strictly dominate"
     /// in the context of nested regions. Block arguments are considered to be defined
     /// at the start of their block, so they dominate all operations in their block and
-    /// blocks dominated by their block.
+    /// blocks dominated by their block. Entry-block arguments are region inputs:
+    /// they are also available in unreachable blocks of that same region or a
+    /// nonisolated descendant. This does not make entry operations or other
+    /// blocks dominate unreachable blocks, or bypass verification of their uses.
+    /// Existing reachable capture behavior is unchanged.
     pub fn value_strictly_dominates_op(
         &mut self,
         ctx: &Context,
@@ -532,6 +570,13 @@ impl DomInfo {
                     b_ancestor_in_a_region.is_some_and(|b_ancestor| {
                         let dom_tree = self.get_dom_tree(ctx, a_block_region);
                         dom_tree.dominates(&a_block, &b_ancestor)
+                            || (dom_tree.root() == Some(a_block)
+                                && !dom_tree.contains(&b_ancestor)
+                                && unreachable_entry_input_scope(
+                                    ctx,
+                                    b_parent_block,
+                                    a_block_region,
+                                ))
                     })
                 } else {
                     false
@@ -582,6 +627,9 @@ impl DomInfo {
                 .get_parent_region()
                 .expect("A block must be in a region");
             let dom_tree = self.get_dom_tree(ctx, region);
+            if !dom_tree.contains(&a) || !dom_tree.contains(&b) {
+                break 'query None;
+            }
             Some(dom_tree.nearest_common_dominator(&a, &b))
         };
         self.require_verification_epoch(ctx);
