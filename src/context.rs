@@ -290,6 +290,13 @@ pub(crate) mod private {
 use private::ArenaObj;
 
 /// Pointer to an IR Object owned by Context.
+///
+/// Equality, hashing and ordering retain both the process-local owner identity
+/// and the complete arena key, including its allocation generation. Ordering is
+/// a transient total order for in-process indexes; its relative order is not a
+/// stable serialization, graph traversal or cross-process identity contract.
+/// Comparing pointers does not dereference them, establish liveness or grant
+/// permission to use a pointer with another context.
 pub struct Ptr<T: ArenaObj> {
     owner: ContextIdentity,
     pub(crate) idx: ArenaIndex,
@@ -410,6 +417,18 @@ impl<T: ArenaObj> PartialEq for Ptr<T> {
 }
 
 impl<T: ArenaObj> Eq for Ptr<T> {}
+
+impl<T: ArenaObj> PartialOrd for Ptr<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: ArenaObj> Ord for Ptr<T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.owner.0, self.idx).cmp(&(other.owner.0, other.idx))
+    }
+}
 
 impl<T: ArenaObj + 'static> Hash for Ptr<T> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
@@ -652,6 +671,7 @@ macro_rules! context_registration {
 
 #[cfg(test)]
 mod mutation_epoch_tests {
+    include!("context_ptr_order_tests.rs");
     use super::{
         Context, ContextIdentityExhausted, DanglingPtrDerefError, ForeignContextPtrDerefError, Ptr,
         private::ArenaObj, take_context_identity,
